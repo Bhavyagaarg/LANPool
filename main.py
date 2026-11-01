@@ -1,6 +1,10 @@
 import argparse
 import asyncio
 import hashlib
+import hmac
+import json
+import re
+import secrets
 import ipaddress
 import logging
 import os
@@ -13,9 +17,14 @@ from typing import Dict, Optional
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from config import PEER_SECRET, MAX_HELPER_REQUESTS
+from core.peer_auth import verify_request, signed_request, verify_content, sign_content, send_bounded, peer_url, peer_client
+from core.url_safety import origin_client
+from core.io_utils import disk_call, acquire_resource, ManagedStreamingResponse
+from core.http_limits import BodyLimitMiddleware
 
 from config import (
     ALLOW_LOOPBACK_DOWNLOADS,
@@ -49,15 +58,38 @@ logger = logging.getLogger("LANPool.Main")
 NODE_ID = uuid.uuid4().hex
 
 
-def require_api_token(request: Request):
-    """
-    Safeguard / Finding 6: API Token Authentication.
-    Reads X-LANPool-Token header when API_TOKEN is configured.
-    """
-    if API_TOKEN:
-        token = request.headers.get("X-LANPool-Token", "").strip()
-        if token != API_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API token")
+_peer_replays = {}
+_download_tickets = {}
+PEER_ROUTES = {"/api/worker/fetch-chunk", "/api/cache/lookup", "/api/qos/boost-notify", "/api/qos/boost-release", "/api/qos/status"}
+
+
+async def require_api_token(request: Request):
+    ticket = request.query_params.get("ticket", "")
+    grant = _download_tickets.pop(ticket, None) if ticket else None
+    if grant and request.method == "GET" and grant[1] >= time.monotonic() and request.url.path == "/api/cache/stream/" + grant[0]:
+        return
+    token = request.headers.get("X-LANPool-Token", "")
+    if API_TOKEN and hmac.compare_digest(token.encode(), API_TOKEN.encode()):
+        return
+    path = request.scope.get("raw_path", request.url.path.encode()).decode("ascii")
+    if request.scope.get("query_string"):
+        path += "?" + request.scope["query_string"].decode("ascii")
+    if (request.url.path in PEER_ROUTES or request.url.path.startswith("/api/cache/stream/")) and verify_request(request.method, path, await request.body(), request.headers, _peer_replays):
+        return
+    # With no admin credential only same-machine callers may control the daemon.
+    host = request.client.host if request.client else ""
+    if not API_TOKEN and host in ("127.0.0.1", "::1", "testclient") and request.url.hostname in ("127.0.0.1", "localhost", "::1", "test", "testserver") and not request.headers.get("X-LANPool-Peer-Signature"):
+        origin = request.headers.get("Origin")
+        if not origin or origin == str(request.base_url).rstrip("/"):
+            return
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def signed_json(data):
+    response = JSONResponse(data)
+    response.headers["X-LANPool-Content-Signature"] = sign_content(hashlib.sha256(response.body).hexdigest())
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def get_node_cache_manager(request: Request) -> CacheManager:
@@ -89,7 +121,9 @@ async def lifespan(app: FastAPI):
     app.state.download_dir = Path(download_dir)
 
     # Initialize per-node CacheManager (Finding 7)
-    app.state.cache_manager = CacheManager(cache_dir=cache_dir)
+    app.state.cache_manager = await asyncio.to_thread(CacheManager, cache_dir=cache_dir)
+    app.state.helper_slots = asyncio.Semaphore(MAX_HELPER_REQUESTS)
+    await load_history(app)
 
     # Initialize per-node QoS Manager (Safeguard #11 & Stage 5)
     qos_manager = getattr(app.state, "qos_manager", None)
@@ -108,6 +142,7 @@ async def lifespan(app: FastAPI):
         beacon_interval=BEACON_INTERVAL_SECONDS,
         peer_ttl=PEER_TTL_SECONDS,
         qos_manager=qos_manager,
+        scheme=getattr(app.state, "http_scheme", "http"),
     )
     app.state.peer_registry = registry
     app.state.peer_discovery = discovery
@@ -116,26 +151,70 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await asyncio.gather(*(task.cancel() for task in download_tasks.values()))
+        await save_history()
         await discovery.stop()
-        if hasattr(app.state, "qos_manager") and app.state.qos_manager:
-            app.state.qos_manager.stop()
+        await app.state.qos_manager.aclose()
+        await asyncio.to_thread(app.state.cache_manager.flush)
 
 
 app = FastAPI(title="LANPool Node", version="1.0.0", lifespan=lifespan)
+app.add_middleware(BodyLimitMiddleware)
 
 # Active download tasks registry
 download_tasks: Dict[str, SoloDownloadTask] = {}
 latest_job_id: Optional[str] = None
+archived_jobs = {}
+_history_lock = asyncio.Lock()
+
+
+async def save_history():
+    async with _history_lock:
+        entries = {**archived_jobs, **{key: task.get_progress() for key, task in download_tasks.items()}}
+        entries = dict(list(entries.items())[-MAX_DOWNLOAD_TASKS:])
+        folder = getattr(app.state, "download_dir", DOWNLOAD_DIR)
+        def persist():
+            path = Path(folder) / "jobs.json"
+            temp = path.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+            os.replace(temp, path)
+        await asyncio.to_thread(persist)
+
+
+async def load_history(application):
+    global latest_job_id
+    path = application.state.download_dir / "jobs.json"
+    def read():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+    for job_id, record in list((await asyncio.to_thread(read)).items())[-MAX_DOWNLOAD_TASKS:]:
+        if not isinstance(record, dict) or not re.fullmatch(r"job-[0-9a-f]+", job_id):
+            continue
+        if record.get("status") in ("probing", "queued", "downloading"):
+            record["status"], record["error"] = "cancelled", "Interrupted by restart; Retry starts a fresh verified download"
+        archived_jobs[job_id] = record
+        latest_job_id = job_id
+    # Only this instance's own incomplete parts; cached completed files are retained.
+    for part in application.state.download_dir.glob("*.part"):
+        part.unlink(missing_ok=True)
 
 
 class DownloadRequest(BaseModel):
-    url: str
-    filename: Optional[str] = None
+    url: str = Field(max_length=8192)
+    filename: Optional[str] = Field(default=None, max_length=180)
+    expected_sha256: str = Field(default="", pattern=r"^(?:[0-9a-fA-F]{64})?$")
+    offline: bool = False
+    use_cache: bool = True
+    use_peers: bool = True
 
 
 class PeerAddRequest(BaseModel):
     ip: str
     port: int = 8000
+    scheme: str = Field(default="http", pattern="^(http|https)$")
 
 
 class WorkerChunkRequest(BaseModel):
@@ -144,10 +223,11 @@ class WorkerChunkRequest(BaseModel):
     end_byte: int
     chunk_id: int
     etag: str = ""
+    total_size: Optional[int] = None
 
 
 class QoSUpdateRequest(BaseModel):
-    share_pct: Optional[int] = None
+    share_pct: Optional[int] = Field(default=None, strict=True)
     boosted: Optional[bool] = None
     simulate_game_mode: Optional[bool] = None
     throttling_enabled: Optional[bool] = None
@@ -156,6 +236,7 @@ class QoSUpdateRequest(BaseModel):
 class BoostRequestModel(BaseModel):
     filename: str
     total_size: int
+    job_id: str = "manual"
 
 
 class BoostNotifyModel(BaseModel):
@@ -163,6 +244,11 @@ class BoostNotifyModel(BaseModel):
     requester_ip: str
     filename: str
     total_size: int
+    job_id: str = "manual"
+
+
+class BoostReleaseModel(BaseModel):
+    job_id: str
 
 
 class BoostResponseModel(BaseModel):
@@ -180,7 +266,9 @@ async def health(request: Request):
     http_port = getattr(request.app.state, "http_port", DEFAULT_PORT)
     node_id = getattr(request.app.state, "node_id", NODE_ID)
 
-    return {
+    return signed_json({
+        "nonce": request.query_params.get("nonce", ""),
+        "qos": {key: request.app.state.qos_manager.get_status()[key] for key in ("effective_share_pct", "effective_game_mode", "boosted")},
         "status": "online",
         "lan_ip": lan_ip,
         "stage": 5,
@@ -192,7 +280,7 @@ async def health(request: Request):
             "running": udp_running,
             "port": udp_port,
         },
-    }
+    })
 
 
 # -----------------------------------------------------------------------------
@@ -246,16 +334,18 @@ async def add_peer(req: PeerAddRequest, request: Request):
     if req.port == current_port and clean_ip in ("127.0.0.1", "localhost", current_lan_ip, "0.0.0.0"):
         raise HTTPException(status_code=400, detail="Cannot add self as a peer.")
 
-    health_url = f"http://{clean_ip}:{req.port}/api/health"
+    nonce = uuid.uuid4().hex
+    health_url = f"{req.scheme}://{clean_ip}:{req.port}/api/health?nonce={nonce}"
     try:
-        async with httpx.AsyncClient(timeout=MANUAL_PEER_PROBE_TIMEOUT_SECONDS) as client:
-            resp = await client.get(health_url)
+        async with peer_client(MANUAL_PEER_PROBE_TIMEOUT_SECONDS) as client:
+            resp = await send_bounded(client, client.build_request("GET", health_url))
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=502,
                     detail=f"Peer health check returned status {resp.status_code} at {health_url}"
                 )
             data = resp.json()
+            peer_trusted = bool(PEER_SECRET and data.get("nonce") == nonce and verify_content(hashlib.sha256(resp.content).hexdigest(), resp.headers.get("X-LANPool-Content-Signature", "")))
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
@@ -294,8 +384,11 @@ async def add_peer(req: PeerAddRequest, request: Request):
         port=req.port,
         node_id=peer_node_id,
         lan_ip=data.get("lan_ip", clean_ip),
+        trusted=peer_trusted,
+        scheme=req.scheme,
     )
-    return peer
+    registry.refresh_health(peer_node_id, data, peer_trusted)
+    return registry.get(peer_node_id)
 
 
 @app.get("/api/diagnostics/network", dependencies=[Depends(require_api_token)])
@@ -342,59 +435,40 @@ async def network_diagnostics(request: Request):
 
 @app.post("/api/worker/fetch-chunk", dependencies=[Depends(require_api_token)])
 async def worker_fetch_chunk(req: WorkerChunkRequest, request: Request):
-    """
-    Stage 4 Helper Endpoint:
-    Fetches a single validated chunk from the origin on behalf of a peer.
-    Enforces Range assertions, ETag pinning, exact byte length, SHA-256 verification,
-    and Stage 5 QoS bandwidth sharing throttling.
-    """
-    if req.start_byte < 0 or req.end_byte < req.start_byte:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid byte range: start_byte must be >= 0 and <= end_byte",
-        )
-    if (req.end_byte - req.start_byte + 1) > CHUNK_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Requested range exceeds CHUNK_SIZE ({CHUNK_SIZE} bytes)",
-        )
-    if req.chunk_id < 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid chunk_id: must be >= 0",
-        )
-
+    if req.start_byte < 0 or req.end_byte < req.start_byte or req.chunk_id < 0 or req.end_byte - req.start_byte + 1 > CHUNK_SIZE:
+        raise HTTPException(400, "Invalid chunk range/id")
+    slots = request.app.state.helper_slots
+    qos = request.app.state.qos_manager
+    if qos.effective_share_pct == 0:
+        raise HTTPException(503, "Sharing is disabled")
+    if slots.locked():
+        raise HTTPException(429, "Helper concurrency limit reached")
+    await slots.acquire()
     try:
         await validate_download_url(req.url, allow_loopback=ALLOW_LOOPBACK_DOWNLOADS)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"SSRF validation failed: {exc}")
-
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            chunk_data, chunk_sha = await fetch_chunk_from_origin(
-                url=req.url,
-                start_byte=req.start_byte,
-                end_byte=req.end_byte,
-                etag=req.etag,
-                client=client,
-            )
-    except RemoteContentChangedError as exc:
-        raise HTTPException(status_code=409, detail=f"Remote content changed: {exc}")
+        data, sha = await fetch_chunk_from_origin(req.url, req.start_byte, req.end_byte, req.etag, total_size=req.total_size, throttle=qos.throttle_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
-
-    qos: Optional[NodeQoSManager] = getattr(request.app.state, "qos_manager", None)
-    if qos:
-        await qos.throttle_bytes(len(chunk_data))
-
-    return Response(
-        content=chunk_data,
-        media_type="application/octet-stream",
-        headers={
-            "Content-Length": str(len(chunk_data)),
-            "X-Chunk-SHA256": chunk_sha,
-        },
-    )
+        slots.release()
+        code = 409 if isinstance(exc, RemoteContentChangedError) else 400 if isinstance(exc, ValueError) else 503 if isinstance(exc, PermissionError) else 502
+        raise HTTPException(code, str(exc))
+    except BaseException:
+        slots.release()
+        raise
+    released = False
+    async def release_slot():
+        nonlocal released
+        if not released:
+            released = True
+            slots.release()
+    async def stream():
+        try:
+            for offset in range(0, len(data), 65536):
+                block = data[offset:offset+65536]
+                await qos.throttle_bytes(len(block))
+                yield block
+        finally:
+            await release_slot()
+    return ManagedStreamingResponse(stream(), on_close=release_slot, media_type="application/octet-stream", headers={"Content-Length": str(len(data)), "X-Chunk-SHA256": sha, "X-LANPool-Content-Signature": sign_content(sha)})
 
 
 # -----------------------------------------------------------------------------
@@ -417,6 +491,9 @@ async def start_download(req: DownloadRequest, request: Request):
             or "/" in sanitized_filename
             or "\\" in sanitized_filename
             or "\x00" in sanitized_filename
+            or any(char in sanitized_filename for char in '<>:"|?*')
+            or sanitized_filename.endswith((".", " "))
+            or sanitized_filename.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
             or os.path.basename(sanitized_filename) != sanitized_filename
         ):
             raise HTTPException(
@@ -426,7 +503,10 @@ async def start_download(req: DownloadRequest, request: Request):
 
     # Finding 6: SSRF URL validation
     try:
-        await validate_download_url(req.url, allow_loopback=ALLOW_LOOPBACK_DOWNLOADS)
+        if not req.offline:
+            await validate_download_url(req.url, allow_loopback=ALLOW_LOOPBACK_DOWNLOADS)
+        elif not req.expected_sha256:
+            raise ValueError("Offline mode requires an expected SHA-256")
     except ValueError as val_err:
         raise HTTPException(status_code=400, detail=f"Invalid download URL: {val_err}")
 
@@ -442,7 +522,7 @@ async def start_download(req: DownloadRequest, request: Request):
     if len(download_tasks) >= MAX_DOWNLOAD_TASKS:
         finished = [
             (jid, t) for jid, t in download_tasks.items()
-            if t.status in ("completed", "failed")
+            if t.status in ("completed", "failed", "cancelled")
         ]
         if finished:
             finished.sort(key=lambda item: item[1].end_time or item[1].start_time or 0)
@@ -475,11 +555,17 @@ async def start_download(req: DownloadRequest, request: Request):
         peer_registry=getattr(request.app.state, "peer_registry", None),
         api_token=API_TOKEN,
         own_node_id=getattr(request.app.state, "node_id", ""),
+        expected_sha256=req.expected_sha256,
+        offline=req.offline,
+        on_state_change=save_history,
+        use_cache=req.use_cache,
+        use_peers=req.use_peers,
     )
     download_tasks[job_id] = task
     latest_job_id = job_id
 
     await task.start()
+    await save_history()
 
     return {
         "job_id": job_id,
@@ -493,11 +579,37 @@ async def start_download(req: DownloadRequest, request: Request):
 async def download_status(job_id: Optional[str] = None):
     """Returns live status, progress, speed, and chunk states for a download job."""
     target_id = job_id or latest_job_id
+    if target_id in archived_jobs and target_id not in download_tasks:
+        return archived_jobs[target_id]
     if not target_id or target_id not in download_tasks:
         raise HTTPException(status_code=404, detail="No active or matching download job found.")
 
     task = download_tasks[target_id]
     return task.get_progress()
+
+
+@app.get("/api/download/jobs", dependencies=[Depends(require_api_token)])
+async def list_jobs():
+    entries = {**archived_jobs, **{key: task.get_progress() for key, task in download_tasks.items()}}
+    return {"jobs": list(entries.values())[-MAX_DOWNLOAD_TASKS:]}
+
+
+@app.post("/api/download/{job_id}/cancel", dependencies=[Depends(require_api_token)])
+async def cancel_job(job_id: str):
+    if job_id not in download_tasks:
+        raise HTTPException(404, "Live job not found")
+    await download_tasks[job_id].cancel()
+    return download_tasks[job_id].get_progress()
+
+
+@app.post("/api/download/{job_id}/retry", dependencies=[Depends(require_api_token)])
+async def retry_job(job_id: str, request: Request):
+    record = download_tasks[job_id].get_progress() if job_id in download_tasks else archived_jobs.get(job_id)
+    if not record:
+        raise HTTPException(404, "Job not found")
+    if record["status"] in ("probing", "queued", "downloading"):
+        raise HTTPException(409, "Cancel the running job before retrying")
+    return await start_download(DownloadRequest(**{key: record[key] for key in ("url", "filename", "expected_sha256", "offline", "use_cache", "use_peers") if key in record}), request)
 
 
 @app.get("/api/test-file/{size_mb}")
@@ -566,7 +678,7 @@ async def serve_test_file(
 async def cache_list(request: Request):
     """Lists all files registered in the LAN-Cache ring buffer."""
     cache_mgr = get_node_cache_manager(request)
-    return cache_mgr.list_items()
+    return await asyncio.to_thread(cache_mgr.list_items)
 
 
 @app.get("/api/cache/lookup", dependencies=[Depends(require_api_token)])
@@ -576,38 +688,72 @@ async def cache_lookup(url: str, request: Request, etag: str = ""):
     Returns {"hit": true, "sha256": ..., "size": ...} on exact composite match, else {"hit": false}.
     """
     cache_mgr = get_node_cache_manager(request)
-    return cache_mgr.lookup(url=url, etag=etag)
+    return signed_json(await asyncio.to_thread(cache_mgr.lookup, url=url, etag=etag))
 
 
 @app.get("/api/cache/stream/{sha256:path}", dependencies=[Depends(require_api_token)])
 async def cache_stream(sha256: str, request: Request):
-    """
-    Safeguard #7: Zero Path Traversal (SHA-256 Hash-Only Serving).
-    Validates strictly 64 hex characters. Serves exclusively from approved in-memory index.
-    """
     clean_sha = sha256.lower().strip()
-    if not HEX_64_PATTERN.match(clean_sha):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid hash format: sha256 must be strictly 64 lowercase hexadecimal characters."
-        )
+    if not HEX_64_PATTERN.fullmatch(clean_sha):
+        raise HTTPException(400, "Invalid SHA-256")
+    manager = get_node_cache_manager(request)
+    qos = request.app.state.qos_manager
+    if qos.effective_share_pct == 0:
+        raise HTTPException(503, "Sharing is disabled")
+    lease = manager.lease(clean_sha)
+    acquired = False
+    try:
+        path = await acquire_resource(lease.__enter__, lambda _: lease.__exit__(None, None, None))
+        acquired = True
+        size = path.stat().st_size
+    except (OSError, ValueError):
+        if acquired:
+            await disk_call(lease.__exit__, None, None, None)
+        raise HTTPException(404, "Cached file missing or corrupt")
+    handle = None
+    closed = False
+    async def close_stream():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        def close():
+            if handle:
+                handle.close()
+            lease.__exit__(None, None, None)
+        await disk_call(close)
+    async def stream():
+        nonlocal handle
+        try:
+            handle = await acquire_resource(lambda: open(path, "rb"), lambda file: file.close())
+            remaining = size
+            while remaining:
+                await qos.throttle_bytes(min(65536, remaining))
+                block = await disk_call(handle.read, min(65536, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+        finally:
+            await close_stream()
+    return ManagedStreamingResponse(stream(), on_close=close_stream, media_type="application/octet-stream", headers={"Content-Length": str(size), "X-LANPool-Content-Signature": sign_content(clean_sha)})
 
-    cache_mgr = get_node_cache_manager(request)
-    file_path = cache_mgr.stream_path(clean_sha)
-    if not file_path or not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Hash '{clean_sha}' not found in approved LAN-Cache."
-        )
 
-    entry = cache_mgr.approved_hash_map.get(clean_sha, {})
-    download_filename = entry.get("filename", f"{clean_sha}.bin")
-
-    return FileResponse(
-        path=file_path,
-        media_type="application/octet-stream",
-        filename=download_filename,
-    )
+@app.post("/api/cache/ticket/{sha256}", dependencies=[Depends(require_api_token)])
+async def create_download_ticket(sha256: str, request: Request):
+    if not HEX_64_PATTERN.fullmatch(sha256):
+        raise HTTPException(400, "Invalid SHA-256")
+    manager = get_node_cache_manager(request)
+    if not (await asyncio.to_thread(manager.find_by_sha, sha256)).get("hit"):
+        raise HTTPException(404, "Cached file not found")
+    for key, grant in list(_download_tickets.items()):
+        if grant[1] < time.monotonic():
+            _download_tickets.pop(key, None)
+    if len(_download_tickets) >= 1024:
+        raise HTTPException(429, "Too many pending download grants")
+    ticket = secrets.token_urlsafe(32)
+    _download_tickets[ticket] = (sha256, time.monotonic() + 30)
+    return JSONResponse({"url": f"/api/cache/stream/{sha256}?ticket={ticket}"}, headers={"Cache-Control": "no-store"})
 
 
 # -----------------------------------------------------------------------------
@@ -650,26 +796,25 @@ async def broadcast_boost_request(req: BoostRequestModel, request: Request):
     node_id = getattr(request.app.state, "node_id", NODE_ID)
     lan_ip = getattr(request.app.state, "lan_ip", None) or get_lan_ip()
     peers = registry.list_peers() if registry else []
-    active_peers = [p for p in peers if p.get("node_id") != node_id]
+    active_peers = [p for p in peers if p.get("node_id") != node_id and p.get("trusted") and p.get("available", True)]
 
-    headers = {}
-    if API_TOKEN:
-        headers["X-LANPool-Token"] = API_TOKEN
+    headers = {}  # Separate peer signatures, never the administrative token.
 
     payload = {
         "requester_id": node_id,
         "requester_ip": lan_ip,
         "filename": req.filename,
         "total_size": req.total_size,
+        "job_id": req.job_id,
     }
 
     async def _notify(p: dict):
         pip = p.get("ip") or p.get("lan_ip")
         pport = p.get("port") or p.get("http_port")
-        url = f"http://{pip}:{pport}/api/qos/boost-notify"
+        url = peer_url(p, "/api/qos/boost-notify")
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                r = await client.post(url, json=payload, headers=headers)
+            async with peer_client(3.0) as client:
+                r = await send_bounded(client, signed_request(client, "POST", url, json=payload))
                 return {
                     "peer": p.get("node_id"),
                     "status": r.status_code,
@@ -703,6 +848,7 @@ async def receive_boost_notification(req: BoostNotifyModel, request: Request):
         requester_ip=req.requester_ip,
         filename=req.filename,
         total_size=req.total_size,
+        job_id=req.job_id,
     )
     return {"accepted": accepted, "reason": reason}
 
@@ -717,6 +863,12 @@ async def respond_to_boost(req: BoostResponseModel, request: Request):
         return qos.respond_to_boost(req.action)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/qos/boost-release", dependencies=[Depends(require_api_token)])
+async def release_boost(req: BoostReleaseModel, request: Request):
+    request.app.state.qos_manager.release_boost(req.job_id)
+    return {"status": "released"}
 
 
 # Static Files & Dashboard UI
@@ -737,22 +889,31 @@ async def serve_dashboard():
 def main():
     parser = argparse.ArgumentParser(description="LANPool Node Daemon")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind (default 8000)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface to bind")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (LAN binding requires API and peer credentials)")
     parser.add_argument("--cache-dir", type=str, default=str(CACHE_DIR), help="Directory for LANPool cache storage")
     parser.add_argument("--download-dir", type=str, default=str(DOWNLOAD_DIR), help="Directory for temporary/completed downloads")
+    parser.add_argument("--tls-certfile", help="TLS certificate chain PEM")
+    parser.add_argument("--tls-keyfile", help="TLS private key PEM")
     args = parser.parse_args()
+    if args.host not in ("127.0.0.1", "::1", "localhost") and (not API_TOKEN or not PEER_SECRET):
+        parser.error("LAN binding requires LANPOOL_API_TOKEN and LANPOOL_PEER_SECRET")
+    if bool(args.tls_certfile) != bool(args.tls_keyfile):
+        parser.error("Provide both TLS certificate and key")
+    if args.host not in ("127.0.0.1", "::1", "localhost") and not args.tls_certfile and os.environ.get("LANPOOL_ALLOW_INSECURE_LAN") != "1":
+        parser.error("LAN binding requires TLS, or explicit LANPOOL_ALLOW_INSECURE_LAN=1 on a trusted VPN/LAN")
 
     app.state.http_port = args.port
-    app.state.lan_ip = get_lan_ip()
+    app.state.http_scheme = "https" if args.tls_certfile else "http"
+    app.state.lan_ip = "127.0.0.1" if args.host in ("127.0.0.1", "localhost") else get_lan_ip()
     app.state.cache_dir = Path(args.cache_dir).resolve()
     app.state.download_dir = Path(args.download_dir).resolve()
 
     if not API_TOKEN:
-        logger.warning("WARNING: LANPOOL_API_TOKEN is not set; any LAN host can use this daemon.")
+        logger.info("No admin token configured; control is restricted to local clients.")
     if ALLOW_LOOPBACK_DOWNLOADS:
-        logger.warning("WARNING: Loopback downloads allowed (default); set LANPOOL_ALLOW_LOOPBACK=0 in production.")
+        logger.info("Loopback origins explicitly enabled for this instance.")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", ssl_certfile=args.tls_certfile, ssl_keyfile=args.tls_keyfile, limit_concurrency=128)
 
 
 if __name__ == "__main__":

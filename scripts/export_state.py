@@ -18,6 +18,9 @@ import urllib.request
 from pathlib import Path
 from typing import List, Tuple
 
+os.environ["LANPOOL_ALLOW_LOOPBACK"] = "1"
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+os.environ["PYTHONUTF8"] = "1"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BOARD_FILE = PROJECT_ROOT / ".agents" / "board.md"
 AUDIT_FILE = PROJECT_ROOT / ".agents" / "code_audit.md"
@@ -25,6 +28,7 @@ OUTPUT_FILE = PROJECT_ROOT / "PROJECT_STATE.md"
 
 EXCLUDED_DIR_NAMES = {
     ".venv",
+    ".venv312",
     "venv",
     "__pycache__",
     ".git",

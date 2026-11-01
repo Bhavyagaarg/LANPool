@@ -590,7 +590,7 @@
 
     <div class="header-actions">
       <button class="btn btn-sm" id="btn-toggle-game" onclick="toggleSimulateGameMode()">
-        <span id="btn-toggle-game-text">Simulate Fullscreen Game</span>
+        <span id="btn-toggle-game-text">Simulate Game Process</span>
       </button>
       <button class="btn btn-sm" onclick="openTokenModal()">API Token</button>
     </div>
@@ -607,6 +607,8 @@
           <span class="mono" id="qos-effective-pill" style="color: var(--wan-blue);">30% EFFECTIVE</span>
         </div>
         <div class="panel-body">
+          <label><input id="qos-throttle" type="checkbox" checked onchange="setThrottling(this.checked)"> Limit shared bandwidth</label>
+          <p id="qos-budget" class="mono"></p>
           <div class="slider-box">
             <div class="slider-header">
               <span class="form-label">Bandwidth Sharing Allocation</span>
@@ -651,7 +653,7 @@
           <form onsubmit="event.preventDefault(); addManualPeer();">
             <div class="form-group">
               <label class="form-label">Peer IPv4 Address</label>
-              <input type="text" class="input-text mono" id="manual-ip" placeholder="192.168.1.50" required>
+              <select id="manual-scheme" class="input-text"><option value="http">HTTP (local/VPN)</option><option value="https">HTTPS</option></select><input type="text" class="input-text mono" id="manual-ip" placeholder="192.168.1.50" required>
             </div>
             <div class="form-group">
               <label class="form-label">Port</label>
@@ -678,6 +680,11 @@
           </div>
         </div>
         <div class="panel-body">
+          <label for="job-selector">Download jobs</label>
+          <select id="job-selector" class="input-text" onchange="currentJobId=this.value; pollDownloadStatus();"></select>
+          <button type="button" class="btn btn-sm" onclick="jobAction('cancel')">Cancel selected job</button>
+          <button type="button" class="btn btn-sm" onclick="jobAction('retry')">Retry from beginning</button>
+          <div id="job-error" role="alert" style="color:var(--danger-red)"></div>
           <form onsubmit="event.preventDefault(); startDownload();">
             <div class="form-group">
               <label class="form-label">Upstream File URL</label>
@@ -689,6 +696,9 @@
                 Start Cooperative Download
               </button>
             </div>
+            <label for="dl-sha">Trusted expected SHA-256 (optional; required for offline mode)</label>
+            <input id="dl-sha" class="input-text mono" pattern="[0-9a-fA-F]{64}" placeholder="64 hex characters">
+            <label><input id="dl-offline" type="checkbox"> Offline: use verified local cache only</label>
           </form>
         </div>
       </div>
@@ -703,15 +713,15 @@
           <div class="speed-matrix mono">
             <div class="speed-card">
               <span class="speed-card-label">Total Aggregate Speed</span>
-              <span class="speed-card-val val-total" id="speed-total">0.00 MB/s</span>
+              <span class="speed-card-val val-total" id="speed-total">0.00 MiB/s</span>
             </div>
             <div class="speed-card">
               <span class="speed-card-label">My Local WAN Speed</span>
-              <span class="speed-card-val val-wan" id="speed-wan">0.00 MB/s</span>
+              <span class="speed-card-val val-wan" id="speed-wan">0.00 MiB/s</span>
             </div>
             <div class="speed-card">
               <span class="speed-card-label">LAN Pooled Boost Speed</span>
-              <span class="speed-card-val val-lan" id="speed-lan">0.00 MB/s</span>
+              <span class="speed-card-val val-lan" id="speed-lan">0.00 MiB/s</span>
             </div>
           </div>
 
@@ -854,6 +864,49 @@
     const historyWan = new Array(maxTicks).fill(0);
     const historyLan = new Array(maxTicks).fill(0);
 
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, char => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"}[char]));
+    }
+
+    async function pollJobs() {
+      const response = await fetch("/api/download/jobs", {headers:getAuthHeaders()});
+      if (!response.ok) return;
+      const data = await response.json();
+      const selector = document.getElementById("job-selector");
+      const signature = JSON.stringify(data.jobs.map(job => [job.job_id, job.filename, job.status]));
+      if (selector.dataset.signature !== signature) {
+        selector.dataset.signature = signature;
+        selector.replaceChildren(...data.jobs.map(job => {
+        const option = document.createElement("option");
+        option.value = job.job_id;
+        option.textContent = `${job.filename} · ${job.status} · ${job.job_id}`;
+        return option;
+        }));
+      }
+      if (currentJobId) selector.value = currentJobId;
+    }
+
+    async function jobAction(action) {
+      if (!currentJobId) return;
+      const response = await fetch(`/api/download/${encodeURIComponent(currentJobId)}/${action}`, {method:"POST", headers:getAuthHeaders()});
+      const data = await response.json();
+      if (!response.ok) { alert(data.detail || "Job action failed"); return; }
+      if (action === "retry") currentJobId = data.job_id;
+      await pollTelemetry();
+    }
+
+    async function downloadCached(sha, filename) {
+      try {
+        const response = await fetch(`/api/cache/ticket/${sha}`, {method:"POST", headers:getAuthHeaders()});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Download authorization failed");
+        const link = document.createElement("a");
+        link.href = data.url;
+        link.download = filename || `${sha}.bin`;
+        link.click();
+      } catch(error) { alert(error.message); }
+    }
+
     function getAuthHeaders() {
       const headers = { "Content-Type": "application/json" };
       const token = localStorage.getItem("lanpool_token");
@@ -877,6 +930,8 @@
 
     /* Polling Loop */
     async function pollTelemetry() {
+      if (window.telemetryBusy) return;
+      window.telemetryBusy = true;
       try {
         await Promise.all([
           pollHealth(),
@@ -884,10 +939,11 @@
           pollPeers(),
           pollCache(),
           pollDownloadStatus(),
+          pollJobs(),
         ]);
       } catch (err) {
         console.error("Poll error:", err);
-      }
+      } finally { window.telemetryBusy = false; }
     }
 
     async function pollHealth() {
@@ -915,6 +971,8 @@
       if (!res.ok) return;
       const data = await res.json();
       activeQoS = data;
+      document.getElementById("qos-throttle").checked = data.throttling_enabled;
+      document.getElementById("qos-budget").textContent = `Shared budget: ${(data.effective_rate_limit_bps / 1048576).toFixed(2)} MiB/s; baseline ${(data.max_helper_kbps / 1024).toFixed(1)} MiB/s`;
 
       document.getElementById("share-slider").value = data.share_pct;
       document.getElementById("share-val").textContent = `${data.share_pct}%`;
@@ -941,7 +999,7 @@
       } else {
         gmBadge.className = "badge mono";
         gmText.textContent = "FOCUS: STANDARD";
-        gmBtnText.textContent = "Simulate Fullscreen Game";
+        gmBtnText.textContent = "Simulate Game Process";
       }
 
       // Check Toast (Safeguard #11)
@@ -973,7 +1031,7 @@
       }
 
       container.innerHTML = peers.map(p => {
-        let qosBadge = `<span class="badge" style="color: var(--text-muted); font-size: 9px;">${p.share_pct || 30}%</span>`;
+        let qosBadge = `<span class="badge" style="color: var(--text-muted); font-size: 9px;">${p.share_pct ?? 30}%</span>`;
         if (p.game_mode) {
           qosBadge = `<span class="badge" style="color: var(--helper-amber); border-color: var(--helper-amber); font-size: 9px;">GAME 15%</span>`;
         } else if (p.boosted) {
@@ -987,10 +1045,10 @@
         return `
           <div class="peer-card">
             <div class="peer-info">
-              <a href="http://${p.ip}:${p.port}" target="_blank" rel="noopener noreferrer" class="peer-endpoint mono" style="color: var(--wan-blue); text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;" title="Open node dashboard in new tab">
+              <a href="${p.scheme || 'http'}://${p.ip}:${p.port}" target="_blank" rel="noopener noreferrer" class="peer-endpoint mono" style="color: var(--wan-blue); text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;" title="Open node dashboard in new tab">
                 ${p.ip}:${p.port} <span style="font-size: 10px; opacity: 0.7;">↗</span>
               </a>
-              <span class="peer-meta mono">${p.node_id ? p.node_id.substring(0, 8) : 'unknown'} · ${p.age_seconds}s ago</span>
+              <span class="peer-meta mono">${escapeHtml(p.node_id ? p.node_id.substring(0, 8) : 'unknown')} · ${p.age_seconds}s ago · ${p.available === false ? "OFFLINE" : (p.trusted ? "PAIRED" : "UNPAIRED")}</span>
             </div>
             <div style="display: flex; gap: 4px; align-items: center;">
               ${srcBadge}
@@ -1007,14 +1065,14 @@
       const data = await res.json();
 
       const totalMb = (data.total_bytes / (1024 * 1024)).toFixed(1);
-      const maxGb = 10;
-      const pct = Math.min(100, (data.total_bytes / (10 * 1024 * 1024 * 1024)) * 100).toFixed(1);
+      const maxGb = data.max_cache_bytes / (1024 ** 3);
+      const pct = Math.min(100, (data.total_bytes / data.max_cache_bytes) * 100).toFixed(1);
 
       document.getElementById("cache-usage-pill").textContent = `${totalMb} MB / ${maxGb} GB (${pct}%)`;
       document.getElementById("cache-meter").style.width = `${pct}%`;
 
       const container = document.getElementById("cache-list-container");
-      const files = data.files || [];
+      const files = data.items || [];
       if (files.length === 0) {
         container.innerHTML = `<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 16px;">
           Cache is empty.
@@ -1028,10 +1086,10 @@
         return `
           <div class="cache-item">
             <div class="cache-item-left">
-              <span class="cache-filename mono" title="${f.filename}">${f.filename}</span>
+              <span class="cache-filename mono" title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</span>
               <span class="cache-hash mono">SHA: ${shaShort}... · ${mb} MB</span>
             </div>
-            <a href="/api/cache/stream/${f.sha256}" class="btn btn-sm" download="${f.filename}" style="padding: 2px 7px;">
+            <a href="#" data-sha="${f.sha256}" data-filename="${escapeHtml(f.filename)}" class="btn btn-sm" onclick="downloadCached(this.dataset.sha, this.dataset.filename); return false;" style="padding: 2px 7px;">
               Stream
             </a>
           </div>
@@ -1049,15 +1107,16 @@
 
       const task = await res.json();
       currentJobId = task.job_id;
+      document.getElementById("job-selector").value = currentJobId;
 
       // Update speeds
-      const totalSpeed = task.speed_mbps || 0;
-      const wanSpeed = task.wan_speed_mbps || 0;
-      const lanSpeed = task.lan_speed_mbps || 0;
+      const totalSpeed = task.speed_mibps || 0;
+      const wanSpeed = task.wan_speed_mibps || 0;
+      const lanSpeed = task.lan_speed_mibps || 0;
 
-      document.getElementById("speed-total").textContent = `${totalSpeed.toFixed(2)} MB/s`;
-      document.getElementById("speed-wan").textContent = `${wanSpeed.toFixed(2)} MB/s`;
-      document.getElementById("speed-lan").textContent = `${lanSpeed.toFixed(2)} MB/s`;
+      document.getElementById("speed-total").textContent = `${totalSpeed.toFixed(2)} MiB/s`;
+      document.getElementById("speed-wan").textContent = `${wanSpeed.toFixed(2)} MiB/s`;
+      document.getElementById("speed-lan").textContent = `${lanSpeed.toFixed(2)} MiB/s`;
 
       updateSpeedChart(wanSpeed, lanSpeed);
 
@@ -1080,6 +1139,9 @@
         modeEl.textContent = `STATUS: ${task.status.toUpperCase()}`;
         modeEl.style.color = task.status === "failed" ? "var(--danger-red)" : "var(--text-muted)";
       }
+
+      modeEl.textContent = `${task.status.toUpperCase()} · ${modeEl.textContent}`;
+      document.getElementById("job-error").textContent = task.error || "";
 
       // Progress
       const curMb = ((task.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
@@ -1209,7 +1271,7 @@
         const res = await fetch("/api/download/start", {
           method: "POST",
           headers: getAuthHeaders(),
-          body: JSON.stringify({ url, filename }),
+          body: JSON.stringify({ url, filename, expected_sha256: document.getElementById("dl-sha").value.trim(), offline: document.getElementById("dl-offline").checked }),
         });
         const data = await res.json();
         if (res.ok) {
@@ -1234,7 +1296,7 @@
         const res = await fetch("/api/peers/add", {
           method: "POST",
           headers: getAuthHeaders(),
-          body: JSON.stringify({ ip, port }),
+          body: JSON.stringify({ ip, port, scheme: document.getElementById("manual-scheme").value }),
         });
         const data = await res.json();
         if (res.ok) {
@@ -1259,7 +1321,7 @@
         const res = await fetch("/api/qos/update", {
           method: "POST",
           headers: getAuthHeaders(),
-          body: JSON.stringify({ share_pct: pct, boosted: false }),
+          body: JSON.stringify({ share_pct: pct, boosted: false, throttling_enabled: true }),
         });
         if (res.ok) {
           logEvent(`QoS updated: Bandwidth share set to ${pct}%.`);
@@ -1270,12 +1332,18 @@
       }
     }
 
+    async function setThrottling(enabled) {
+      const response = await fetch("/api/qos/update", {method:"POST", headers:getAuthHeaders(), body:JSON.stringify({throttling_enabled:enabled})});
+      if (!response.ok) alert("Could not update bandwidth limit");
+      await pollQoS();
+    }
+
     async function boostTo80() {
       try {
         const res = await fetch("/api/qos/update", {
           method: "POST",
           headers: getAuthHeaders(),
-          body: JSON.stringify({ share_pct: 80, boosted: true }),
+          body: JSON.stringify({ boosted: true }),
         });
         if (res.ok) {
           logEvent("Good Samaritan Boost manually activated (80% allocation).");
@@ -1295,7 +1363,7 @@
           body: JSON.stringify({ simulate_game_mode: nextState }),
         });
         if (res.ok) {
-          logEvent(`Simulate Fullscreen Game Mode: ${nextState ? 'ACTIVE (Safeguard #11 Capped)' : 'DEACTIVATED'}`);
+          logEvent(`Simulate Game Process Mode: ${nextState ? 'ACTIVE (Safeguard #11 Capped)' : 'DEACTIVATED'}`);
           pollQoS();
         }
       } catch (err) {

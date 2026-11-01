@@ -31,6 +31,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+
 import httpx
 
 from config import CHUNK_SIZE, MAX_CHUNK_RETRIES
@@ -287,7 +291,7 @@ class MockOfflineHealthHandler(http.server.BaseHTTPRequestHandler):
     """Returns status: offline to test peer health validation (Finding 6)."""
 
     def do_GET(self):
-        if self.path == "/api/health":
+        if self.path.split("?", 1)[0] == "/api/health":
             body = json.dumps({"status": "offline", "node_id": "mock_offline_node"}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

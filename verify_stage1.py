@@ -18,6 +18,10 @@ import sys
 import time
 from typing import Dict, List, Set
 
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+
 import httpx
 
 from config import CACHE_DIR, CHUNK_SIZE, DEFAULT_PORT, DOWNLOAD_DIR
@@ -205,14 +209,7 @@ async def run_verification(server_url: str = "http://127.0.0.1:8000"):
     # 8. Safeguard #4: Poison Assertion Test
     print("\n[Step 8] Testing Safeguard #4 (Captive Portal / HTTP 200 Poison Guard)...")
     # Simulate a network worker encountering HTTP 200 on a Range request
-    class MockClient:
-        async def get(self, *args, **kwargs):
-            # Return HTTP 200 (Captive Portal Login HTML) instead of HTTP 206
-            return httpx.Response(
-                status_code=200,
-                content=b"<html><body>Captive Portal Login Required</body></html>",
-                request=httpx.Request("GET", "http://test")
-            )
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"captive portal", request=request)))
 
     test_chunk = task.chunks[0]
     test_chunk.status = "queued"
@@ -221,16 +218,18 @@ async def run_verification(server_url: str = "http://127.0.0.1:8000"):
     
     test_task = SoloDownloadTask(
         job_id="test-poison",
-        url="http://test",
+        url="http://127.0.0.1/test",
         download_dir=DOWNLOAD_DIR
     )
-    test_task.final_url = "http://test"
+    test_task.final_url = "http://127.0.0.1/test"
     test_task.chunks = [test_chunk]
     test_task.chunk_queue = test_queue
     
-    worker_task = asyncio.create_task(test_task._network_worker("worker-poison-test", MockClient()))
-    await asyncio.sleep(0.1)
+    worker_task = asyncio.create_task(test_task._network_worker("worker-poison-test", mock_client))
+    await asyncio.sleep(0.2)
     worker_task.cancel()
+    await asyncio.gather(worker_task, return_exceptions=True)
+    await mock_client.aclose()
     
     print(f"  ✓ Poisoned Chunk State after HTTP 200 response: status={test_chunk.status}, retries={test_chunk.retries}")
     assert test_chunk.retries >= 1, "Poisoned chunk retry counter did not increment"

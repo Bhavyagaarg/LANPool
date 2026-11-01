@@ -36,6 +36,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+
 import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -382,7 +386,7 @@ def check5_web_ui_and_telemetry():
         assert "chunk-matrix" in html_text, "Missing 10MB chunk matrix in Web UI!"
         assert "peer-list-container" in html_text, "Missing peer list container in Web UI!"
         assert "boost-toast" in html_text, "Missing Good Samaritan boost toast in Web UI!"
-        assert "Simulate Fullscreen Game" in html_text, "Missing Game Mode simulation toggle button!"
+        assert "Simulate Game Process" in html_text, "Missing Game Mode simulation toggle button!"
 
         # 2. Trigger a 1 MB test download and verify telemetry fields
         dl_url = f"http://127.0.0.1:{port}/api/test-file/1"

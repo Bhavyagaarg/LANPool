@@ -6,13 +6,12 @@ Has zero imports from main, app, or cache_manager.
 """
 
 import functools
+import hashlib
 
 
 @functools.lru_cache(maxsize=2)
 def get_deterministic_data(size_mb: int) -> bytes:
     """Generates deterministic pseudo-random binary data of size size_mb MB."""
     total_bytes = size_mb * 1024 * 1024
-    # Seeded 64KB block repeated
-    seed_block = bytes([(i * 37 + 19) % 256 for i in range(65536)])
-    repeats = (total_bytes // 65536) + 1
-    return (seed_block * repeats)[:total_bytes]
+    # Position-dependent data: equal-sized ranges at different offsets differ.
+    return hashlib.shake_256(f"LANPool-test-v2-{size_mb}".encode()).digest(total_bytes)

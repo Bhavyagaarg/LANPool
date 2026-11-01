@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import secrets
 import socket
 import socketserver
 import subprocess
@@ -41,6 +42,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import httpx
+
+def demo_get(url, **kwargs):
+    kwargs.setdefault("headers", {"X-LANPool-Token": os.environ.get("LANPOOL_API_TOKEN", "")})
+    kwargs.setdefault("trust_env", False)
+    return httpx.get(url, **kwargs)
+
+
+def demo_post(url, **kwargs):
+    kwargs.setdefault("headers", {"X-LANPool-Token": os.environ.get("LANPOOL_API_TOKEN", "")})
+    kwargs.setdefault("trust_env", False)
+    return httpx.post(url, **kwargs)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -66,10 +79,7 @@ DEMO_FILE_SPECS = {
 
 def generate_file_payload(filename: str, size: int) -> Tuple[bytes, str]:
     """Generates deterministic byte payload seeded by filename with minimal RAM churn."""
-    seed = sum(ord(c) for c in filename) % 256
-    block = bytes([(seed ^ ((i * 7) % 256)) for i in range(65536)])
-    repeats = (size // len(block)) + 1
-    data = (block * repeats)[:size]
+    data = hashlib.shake_256(("LANPool-demo-v2-" + filename).encode()).digest(size)
     sha = hashlib.sha256(data).hexdigest()
     return data, sha
 
@@ -242,9 +252,23 @@ class DemoClusterManager:
     ):
         self.base_port = base_port
         self.node1_port = base_port
-        self.node2_port = base_port + 1
-        self.node3_port = base_port + 2
-        self.origin_port = origin_port or (8090 if base_port == 8001 else base_port + 89)
+        if not 1 <= base_port <= 65535:
+            raise ValueError("base-port must be 1..65535")
+        used = {base_port}
+        def free_port():
+            while True:
+                with socket.socket() as sock:
+                    sock.bind(("127.0.0.1", 0))
+                    port = sock.getsockname()[1]
+                if port not in used:
+                    used.add(port)
+                    return port
+        self.node2_port = 8002 if base_port == 8001 else free_port()
+        self.node3_port = 8003 if base_port == 8001 else free_port()
+        self.origin_port = origin_port or (8090 if base_port == 8001 else free_port())
+        self.peer_secret = os.environ.get("LANPOOL_PEER_SECRET") or secrets.token_hex(32)
+        self.log_paths = {}
+        self._port_holds = {}
         self.headless = headless
 
         self.runtime_dir = runtime_dir or (PROJECT_ROOT / "demo_runtime")
@@ -286,15 +310,14 @@ class DemoClusterManager:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["LANPOOL_ALLOW_LOOPBACK"] = "1"
+        env["LANPOOL_PEER_SECRET"] = self.peer_secret
 
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            env=env,
-        )
+        self.log_paths[port] = node_dir / "node.log"
+        hold = self._port_holds.pop(port, None)
+        if hold:
+            hold.close()
+        with self.log_paths[port].open("w", encoding="utf-8") as log:
+            proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=log, stderr=subprocess.STDOUT, text=True, env=env)
         self.node_procs[port] = proc
         return proc
 
@@ -304,8 +327,11 @@ class DemoClusterManager:
         start = time.time()
         last_err = None
         while time.time() - start < timeout:
+            if self.node_procs[port].poll() is not None:
+                log = self.log_paths[port].read_text(encoding="utf-8", errors="replace")[-4000:]
+                raise RuntimeError(f"Node {port} exited early: {log}")
             try:
-                resp = httpx.get(url, timeout=1.0)
+                resp = demo_get(url, timeout=1.0)
                 if resp.status_code == 200:
                     return resp.json()
             except Exception as e:
@@ -316,7 +342,23 @@ class DemoClusterManager:
     def boot_cluster(self, fast_mode: bool = False) -> None:
         """Boots origin server, spawns 3 nodes, cross-registers peers, and configures QoS roles."""
         throttle_delay = 0.015 if fast_mode else 0.12
-        self.start_origin_server(throttle_delay)
+        ports = (self.node1_port, self.node2_port, self.node3_port, self.origin_port)
+        if len(set(ports)) != 4 or any(not 1 <= port <= 65535 for port in ports):
+            raise ValueError("Cluster requires four distinct valid ports")
+        try:
+            for port in ports:
+                hold = socket.socket()
+                try:
+                    hold.bind(("127.0.0.1", port))
+                except BaseException:
+                    hold.close()
+                    raise
+                self._port_holds[port] = hold
+            self._port_holds.pop(self.origin_port).close()
+            self.start_origin_server(throttle_delay)
+        except BaseException:
+            self.stop_cluster(cleanup_runtime=False)
+            raise
 
         # Spawn all 3 nodes
         for port in (self.node1_port, self.node2_port, self.node3_port):
@@ -333,7 +375,7 @@ class DemoClusterManager:
             for dst_port in ports:
                 if src_port != dst_port:
                     try:
-                        httpx.post(
+                        demo_post(
                             f"http://127.0.0.1:{src_port}/api/peers/add",
                             json={"ip": "127.0.0.1", "port": dst_port},
                             timeout=3.0,
@@ -343,21 +385,21 @@ class DemoClusterManager:
 
         # Configure Node Roles (QoS Settings)
         # Node 1: Primary Requester (Default 30%)
-        httpx.post(
+        demo_post(
             f"http://127.0.0.1:{self.node1_port}/api/qos/update",
             json={"share_pct": 30},
             timeout=3.0,
         )
 
         # Node 2: Idle Helper (Boosted 80%)
-        httpx.post(
+        demo_post(
             f"http://127.0.0.1:{self.node2_port}/api/qos/update",
             json={"share_pct": 80, "boosted": True},
             timeout=3.0,
         )
 
         # Node 3: Gaming PC (Fullscreen Game Mode simulated -> 15% cap)
-        httpx.post(
+        demo_post(
             f"http://127.0.0.1:{self.node3_port}/api/qos/update",
             json={"simulate_game_mode": True},
             timeout=3.0,
@@ -376,17 +418,17 @@ class DemoClusterManager:
         logger.info("Starting Stage 6 Headless Verification...")
 
         # 1. Verify Node 2 QoS
-        q2 = httpx.get(f"http://127.0.0.1:{self.node2_port}/api/qos/status", timeout=3.0).json()
+        q2 = demo_get(f"http://127.0.0.1:{self.node2_port}/api/qos/status", timeout=3.0).json()
         assert q2.get("boosted") is True, f"Node 2 should be boosted: {q2}"
         assert q2.get("effective_share_pct") == 80, f"Node 2 share should be 80: {q2}"
 
         # 2. Verify Node 3 QoS
-        q3 = httpx.get(f"http://127.0.0.1:{self.node3_port}/api/qos/status", timeout=3.0).json()
+        q3 = demo_get(f"http://127.0.0.1:{self.node3_port}/api/qos/status", timeout=3.0).json()
         assert q3.get("effective_game_mode") is True, f"Node 3 should have effective_game_mode=True: {q3}"
         assert q3.get("effective_share_pct") <= 15, f"Node 3 share should be <= 15: {q3}"
 
         # 3. Verify Peer Count on Node 1
-        p1 = httpx.get(f"http://127.0.0.1:{self.node1_port}/api/peers/list", timeout=3.0).json()
+        p1 = demo_get(f"http://127.0.0.1:{self.node1_port}/api/peers/list", timeout=3.0).json()
         peers = p1 if isinstance(p1, list) else p1.get("peers", [])
         assert len(peers) >= 2, f"Node 1 should discover at least 2 peers, got: {len(peers)}"
 
@@ -395,7 +437,7 @@ class DemoClusterManager:
         dest_filename = "verified_game_update.pak"
         expected_sha = ORIGIN_SHAS["game-update-60mb.pak"]
 
-        start_resp = httpx.post(
+        start_resp = demo_post(
             f"http://127.0.0.1:{self.node1_port}/api/download/start",
             json={"url": demo_url, "filename": dest_filename},
             timeout=5.0,
@@ -409,7 +451,7 @@ class DemoClusterManager:
         seen_workers = set()
 
         while time.time() < deadline:
-            st = httpx.get(
+            st = demo_get(
                 f"http://127.0.0.1:{self.node1_port}/api/download/status",
                 params={"job_id": job_id},
                 timeout=3.0,
@@ -443,7 +485,7 @@ class DemoClusterManager:
         assert hashlib.sha256(cached_matches[0].read_bytes()).hexdigest() == expected_sha
 
         # 5. Verify Broadcast Boost Request & Suppression
-        boost_resp = httpx.post(
+        boost_resp = demo_post(
             f"http://127.0.0.1:{self.node1_port}/api/qos/boost-request",
             json={"filename": dest_filename, "total_size": DEMO_FILE_SPECS["game-update-60mb.pak"]},
             timeout=5.0,
@@ -453,11 +495,11 @@ class DemoClusterManager:
         assert boost_data.get("status") == "broadcast_complete"
 
         # Check Node 3 (Gaming PC) suppressed the notification
-        q3_after = httpx.get(f"http://127.0.0.1:{self.node3_port}/api/qos/status", timeout=3.0).json()
+        q3_after = demo_get(f"http://127.0.0.1:{self.node3_port}/api/qos/status", timeout=3.0).json()
         assert q3_after.get("active_boost_request") is None, "Node 3 should suppress boost request popup in Game Mode"
 
         # Check Node 2 received the boost request
-        q2_after = httpx.get(f"http://127.0.0.1:{self.node2_port}/api/qos/status", timeout=3.0).json()
+        q2_after = demo_get(f"http://127.0.0.1:{self.node2_port}/api/qos/status", timeout=3.0).json()
         assert q2_after.get("active_boost_request") is not None, "Node 2 should have received active boost request"
 
         print("\n" + "=" * 60)
@@ -468,6 +510,9 @@ class DemoClusterManager:
     def stop_cluster(self, cleanup_runtime: bool = True) -> None:
         """Terminates all nodes and shuts down origin server cleanly."""
         logger.info("Stopping demo cluster...")
+        for hold in self._port_holds.values():
+            hold.close()
+        self._port_holds.clear()
         for port, proc in list(self.node_procs.items()):
             try:
                 proc.terminate()
@@ -525,6 +570,7 @@ def main():
         base_port=args.base_port,
         origin_port=args.origin_port,
         headless=args.headless_check,
+        runtime_dir=Path(tempfile.mkdtemp(prefix="lanpool_headless_")) if args.headless_check else None,
     )
 
     def handle_sigint(sig, frame):
@@ -546,7 +592,11 @@ def main():
     # Interactive Presentation Mode
     print(BANNER)
     print("🚀 Initializing 3-Node LANPool Live Demonstration Cluster...")
-    cluster.boot_cluster(fast_mode=False)
+    try:
+        cluster.boot_cluster(fast_mode=False)
+    except BaseException:
+        cluster.stop_cluster(cleanup_runtime=args.cleanup)
+        raise
 
     origin_p = cluster.origin_port
     n1_p = cluster.node1_port

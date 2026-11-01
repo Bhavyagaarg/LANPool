@@ -3,6 +3,15 @@ __pycache__/
 *.py[cod]
 *.part
 .venv/
+.venv*/
+*.pid
+LOCAL_AUDIT_RESULTS.json
+LOCAL_SMOKE_RESULTS.json
+LOCAL_REVIEW.md
+requirements-local.lock.txt
+benchmark-results.json
+*.pem
+*.key
 venv/
 *.log
 

@@ -45,6 +45,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+
 import httpx
 
 from config import CHUNK_SIZE
@@ -517,8 +521,9 @@ def check1_helper_endpoint(origin_url: str) -> None:
         assert final_st.get("status") == "completed", f"Download failed: {final_st}"
         assert final_st.get("sha256") == PAYLOAD_SHA, f"Corrupted SHA accepted! Expected {PAYLOAD_SHA}, got {final_st.get('sha256')}"
 
-        # Verify fake helper was actually called and its corrupt response rejected
-        assert fake_helper.server.fake_chunks >= 1, f"Fake helper was never called: fake_chunks={fake_helper.server.fake_chunks}"
+        # An unpaired fake helper must be excluded before receiving any work or secrets.
+        assert fake_helper.server.fake_chunks == 0, "Unpaired helper received download work"
+        assert r_add.json().get("trusted") is False, "Fake helper was incorrectly paired"
         # Verify no corrupt cache file was registered
         cands = list(tmp_c_fake.glob(f"{PAYLOAD_SHA}_*"))
         assert len(cands) == 1, f"Expected canonical cache entry for valid SHA, found {cands}"

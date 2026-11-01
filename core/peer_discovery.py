@@ -11,7 +11,13 @@ import json
 import logging
 import socket
 import time
-from typing import Optional
+import math
+import uuid
+import hashlib
+import httpx
+from typing import Any, Optional
+from core.peer_auth import beacon_signature, trusted_beacon, verify_content, send_bounded, peer_client, peer_url
+from config import PEER_SECRET
 
 from config import BEACON_INTERVAL_SECONDS, PEER_TTL_SECONDS, UDP_DISCOVERY_PORT
 from core.peer_registry import PeerRegistry
@@ -43,6 +49,7 @@ class PeerDiscovery:
         beacon_interval: float = BEACON_INTERVAL_SECONDS,
         peer_ttl: float = PEER_TTL_SECONDS,
         qos_manager: Optional[Any] = None,
+        scheme: str = "http",
     ):
         self.node_id = node_id
         self.http_port = http_port
@@ -52,6 +59,7 @@ class PeerDiscovery:
         self.beacon_interval = beacon_interval
         self.peer_ttl = peer_ttl
         self.qos_manager = qos_manager
+        self.scheme = scheme
 
         self.listener_running = False
         self.reuse_address = True
@@ -170,7 +178,7 @@ class PeerDiscovery:
             return
         if not peer_lan_ip or not isinstance(peer_lan_ip, str):
             return
-        if not isinstance(ts, (int, float)):
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
             return
 
         # Finding 9: Timestamp window check (reject timestamps older or future by > 60s)
@@ -192,9 +200,19 @@ class PeerDiscovery:
         if peer_node_id == self.node_id:
             return
 
-        share_pct = int(packet.get("share_pct", 30))
-        game_mode = bool(packet.get("game_mode", False))
-        boosted = bool(packet.get("boosted", False))
+        share_pct = packet.get("share_pct", 30)
+        game_mode = packet.get("game_mode", False)
+        boosted = packet.get("boosted", False)
+        if type(share_pct) is not int or not 0 <= share_pct <= 100 or type(game_mode) is not bool or type(boosted) is not bool:
+            return
+        if len(peer_node_id) > 64:
+            return
+        trusted = trusted_beacon(packet)
+        scheme = packet.get("scheme", "http")
+        if scheme not in ("http", "https"):
+            return
+        if PEER_SECRET and not trusted:
+            return
 
         self.last_beacon_received = now
         self.registry.upsert_udp(
@@ -205,6 +223,8 @@ class PeerDiscovery:
             share_pct=share_pct,
             game_mode=game_mode,
             boosted=boosted,
+            trusted=trusted,
+            scheme=scheme,
         )
 
     def broadcast_beacon(self):
@@ -217,16 +237,20 @@ class PeerDiscovery:
             "http_port": self.http_port,
             "lan_ip": self.lan_ip,
             "timestamp": time.time(),
+            "scheme": self.scheme,
         }
         if self.qos_manager is not None:
             beacon_data["share_pct"] = getattr(self.qos_manager, "effective_share_pct", 30)
             beacon_data["game_mode"] = getattr(self.qos_manager, "effective_game_mode", False)
             beacon_data["boosted"] = getattr(self.qos_manager, "boosted", False)
 
+        if PEER_SECRET:
+            beacon_data["signature"] = beacon_signature(beacon_data)
         payload = json.dumps(beacon_data).encode("utf-8")
 
         sent_any = False
-        for target in ("255.255.255.255", "127.255.255.255"):
+        targets = ("127.255.255.255",) if self.lan_ip.startswith("127.") else ("255.255.255.255", "127.255.255.255")
+        for target in targets:
             try:
                 if self.transport and not self.transport.is_closing():
                     self.transport.sendto(payload, (target, self.udp_port))
@@ -272,6 +296,22 @@ class PeerDiscovery:
         """Periodically reaps expired UDP peer leases."""
         while not self._stop_event.is_set():
             try:
+                async def refresh(peer):
+                    if not peer.get("manual"):
+                        return
+                    nonce = uuid.uuid4().hex
+                    try:
+                        async with peer_client(2) as client:
+                            response = await send_bounded(client, client.build_request("GET", peer_url(peer, "/api/health"), params={"nonce": nonce}))
+                            response.raise_for_status()
+                            data = response.json()
+                            trusted = bool(data.get("nonce") == nonce and verify_content(hashlib.sha256(response.content).hexdigest(), response.headers.get("X-LANPool-Content-Signature", "")))
+                            if not isinstance(data.get("node_id"), str) or not data["node_id"] or (PEER_SECRET and not trusted):
+                                raise ValueError("Peer identity changed")
+                            self.registry.refresh_health(peer["node_id"], data, trusted)
+                    except (httpx.HTTPError, ValueError):
+                        self.registry.refresh_health(peer["node_id"])
+                await asyncio.gather(*(refresh(p) for p in self.registry.list_peers()))
                 reaped = self.registry.reap_stale(self.peer_ttl)
                 if reaped:
                     logger.info(f"Reaped stale UDP peers: {reaped}")

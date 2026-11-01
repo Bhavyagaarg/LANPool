@@ -42,6 +42,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
+
 import httpx
 
 import core.cache_manager

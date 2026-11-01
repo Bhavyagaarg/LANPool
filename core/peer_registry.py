@@ -40,6 +40,8 @@ class PeerRegistry:
         share_pct: int = 30,
         game_mode: bool = False,
         boosted: bool = False,
+        trusted: bool = False,
+        scheme: str = "http",
     ) -> Optional[dict]:
         """
         Inserts or updates a peer discovered via UDP broadcast beacon.
@@ -70,13 +72,17 @@ class PeerRegistry:
                 existing["last_seen"] = now
                 if lan_ip:
                     existing["lan_ip"] = lan_ip
-                if ip != "127.0.0.1" or existing.get("ip") in (None, "", "127.0.0.1"):
+                if not existing.get("manual") and (ip != "127.0.0.1" or existing.get("ip") in (None, "", "127.0.0.1")):
                     existing["ip"] = ip
-                existing["port"] = port
+                if not existing.get("manual"):
+                    existing["port"] = port
                 existing["node_id"] = node_id
                 existing["share_pct"] = share_pct
                 existing["game_mode"] = game_mode
                 existing["boosted"] = boosted
+                existing["trusted"] = trusted
+                if not existing.get("manual"):
+                    existing["scheme"] = scheme
                 if was_manual:
                     existing["manual"] = True
                     existing["source"] = "manual"
@@ -98,6 +104,8 @@ class PeerRegistry:
                 "share_pct": share_pct,
                 "game_mode": game_mode,
                 "boosted": boosted,
+                "trusted": trusted,
+                "scheme": scheme,
                 "first_seen": now,
                 "last_seen": now,
             }
@@ -110,6 +118,8 @@ class PeerRegistry:
         port: int,
         node_id: Optional[str] = None,
         lan_ip: Optional[str] = None,
+        trusted: bool = False,
+        scheme: str = "http",
     ) -> dict:
         """
         Manually adds a peer (typically via POST /api/peers/add fallback).
@@ -150,6 +160,8 @@ class PeerRegistry:
                 existing["manual"] = True
                 existing["source"] = "manual"
                 existing["last_seen"] = now
+                existing["trusted"] = trusted
+                existing["scheme"] = scheme
                 if node_id:
                     existing["node_id"] = node_id
                 if lan_ip:
@@ -175,6 +187,8 @@ class PeerRegistry:
                 "share_pct": 30,
                 "game_mode": False,
                 "boosted": False,
+                "trusted": trusted,
+                "scheme": scheme,
                 "first_seen": now,
                 "last_seen": now,
             }
@@ -202,6 +216,7 @@ class PeerRegistry:
                 d.setdefault("game_mode", False)
                 d.setdefault("boosted", False)
                 d["age_seconds"] = max(0.0, round(now - p.get("last_seen", now), 2))
+                d["available"] = now - p.get("last_seen", 0) <= 15
                 result.append(d)
             return sorted(result, key=lambda x: x["last_seen"], reverse=True)
 
@@ -212,6 +227,28 @@ class PeerRegistry:
             manual = sum(1 for p in self._peers.values() if p.get("manual", False))
             udp = total - manual
             return {"total": total, "udp": udp, "manual": manual}
+
+    def refresh_health(self, node_id, health=None, trusted=False):
+        """Manual peers remain configured, but availability/QoS use a live lease."""
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if not peer:
+                return
+            if health is None:
+                peer["last_seen"] = 0
+                return
+            qos = health.get("qos", {})
+            share = qos.get("effective_share_pct", 30)
+            if type(share) is not int or not 0 <= share <= 100:
+                return
+            new_id = health.get("node_id", node_id)
+            if trusted and isinstance(new_id, str) and new_id and len(new_id) <= 64 and new_id != node_id:
+                if self.is_self(peer["ip"], peer["port"], new_id):
+                    return
+                self._peers.pop(node_id)
+                peer["node_id"] = new_id
+                self._peers[new_id] = peer
+            peer.update(last_seen=time.time(), trusted=trusted, share_pct=share, game_mode=bool(qos.get("effective_game_mode")), boosted=bool(qos.get("boosted")))
 
     def reap_stale(self, ttl_seconds: float) -> List[str]:
         """

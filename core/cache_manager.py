@@ -6,6 +6,9 @@ import re
 import shutil
 import time
 import uuid
+import threading
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -13,6 +16,18 @@ from config import CACHE_DIR, MAX_CACHE_BYTES
 
 logger = logging.getLogger("LANPool.CacheManager")
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
+def strong_etag(etag):
+    return bool(etag and etag.strip() and not etag.strip().startswith("W/"))
 
 
 def compute_file_sha256(filepath: Union[str, Path]) -> str:
@@ -45,6 +60,8 @@ class CacheManager:
     """
 
     def __init__(self, cache_dir: Union[str, Path] = CACHE_DIR, max_cache_bytes: int = MAX_CACHE_BYTES):
+        self._lock = threading.RLock()
+        self._leases = {}
         self.cache_dir = Path(cache_dir).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_cache_bytes = max_cache_bytes
@@ -59,6 +76,7 @@ class CacheManager:
 
         self.scan_and_rebuild()
 
+    @synchronized
     def get_total_bytes(self) -> int:
         """Returns sum of sizes of currently indexed files."""
         return self._total_bytes
@@ -78,6 +96,9 @@ class CacheManager:
             orig_url = item.get("original_url", "").strip()
             if orig_url and orig_url != url:
                 self._lookup_index[(orig_url, norm_etag)] = sha
+            for alias in item.get("aliases", []):
+                if strong_etag(alias.get("etag", "")):
+                    self._lookup_index[(alias["url"], normalize_etag(alias["etag"]))] = sha
 
         self._total_bytes = total
 
@@ -107,6 +128,7 @@ class CacheManager:
         resolved_paths = [Path(item["path"]).resolve() for item in self.approved_hash_map.values()]
         assert len(resolved_paths) == len(set(resolved_paths)), "Path collision invariant violated!"
 
+    @synchronized
     def scan_and_rebuild(self) -> None:
         """
         Safeguard #9: Deep-Freeze / Reboot Resilience.
@@ -173,7 +195,8 @@ class CacheManager:
                     filename = prev_entry.get("filename") or (parts[1] if claimed_sha and len(parts) > 1 else p.name)
                     url = prev_entry.get("url", "")
                     original_url = prev_entry.get("original_url", url)
-                    etag = prev_entry.get("etag", "")
+                    # Old indexes stripped weak prefixes, losing validator provenance.
+                    etag = prev_entry.get("etag", "") if prev_entry.get("validator_version") == 2 else ""
                     last_access = prev_entry.get("last_access", file_mtime)
 
                     canonical_name = f"{actual_sha}_{filename}"
@@ -208,6 +231,8 @@ class CacheManager:
                         "mtime": file_mtime,
                         "mtime_ns": file_mtime_ns,
                         "last_access": last_access,
+                        "aliases": prev_entry.get("aliases", []) if prev_entry.get("validator_version") == 2 else [],
+                        "validator_version": 2,
                     }
 
                     if actual_sha not in sha_to_candidates:
@@ -252,12 +277,16 @@ class CacheManager:
                 "mtime": kept["mtime"],
                 "mtime_ns": kept["mtime_ns"],
                 "last_access": kept.get("last_access", kept["mtime"]),
+                "aliases": kept.get("aliases", []),
+                "validator_version": 2,
             }
 
         self.approved_hash_map = new_map
         self._dedupe_paths()
+        self._evict_to_fit(0)
         self._persist_index()
 
+    @synchronized
     def _persist_index(self) -> None:
         """Atomically persists approved_hash_map to cache_index.json using unique temp file."""
         unique_suffix = f"{os.getpid()}.{uuid.uuid4().hex[:6]}"
@@ -275,6 +304,7 @@ class CacheManager:
                 except Exception:
                     pass
 
+    @synchronized
     def register_completed(
         self,
         file_path: Union[str, Path],
@@ -301,7 +331,9 @@ class CacheManager:
                 logger.error(f"Cannot register cache file: invalid sha256 '{sha256}'")
                 return False
 
-            actual_size = size if size > 0 else src_path.stat().st_size
+            actual_size = src_path.stat().st_size
+            if (size > 0 and size != actual_size) or compute_file_sha256(src_path) != sha256_lower:
+                raise ValueError("Cache registration size/hash mismatch")
 
             # Safeguard #8: If a single file exceeds entire quota, skip caching
             if actual_size > self.max_cache_bytes:
@@ -313,28 +345,22 @@ class CacheManager:
 
             # Subtract replaced sha's size if already present (to avoid double counting during eviction check)
             old_entry = self.approved_hash_map.get(sha256_lower)
-            effective_total = self._total_bytes - (old_entry.get("size", 0) if old_entry else 0)
-
-            # True LRU Eviction loop (Finding 12): evict oldest items by min(last_access, mtime)
-            while (effective_total + actual_size) > self.max_cache_bytes:
-                if not self.approved_hash_map:
-                    break
-
-                # Evict candidate with oldest last_access (fallback to mtime)
-                oldest_sha = min(
-                    self.approved_hash_map.keys(),
-                    key=lambda k: self.approved_hash_map[k].get("last_access", self.approved_hash_map[k].get("mtime", 0)),
-                )
-                oldest_entry = self.approved_hash_map.pop(oldest_sha)
-                effective_total -= oldest_entry.get("size", 0)
-
-                oldest_path = Path(oldest_entry["path"])
-                try:
-                    if oldest_path.exists():
-                        oldest_path.unlink()
-                        logger.info(f"LRU evicted oldest cache file: {oldest_path.name}")
-                except Exception as e:
-                    logger.warning(f"Error unlinking evicted file {oldest_path}: {e}")
+            if not self._evict_to_fit(0 if old_entry else actual_size, exclude=sha256_lower):
+                return False  # Active streams/failed deletions still count toward quota.
+            aliases = list(old_entry.get("aliases", [])) if old_entry else []
+            for metadata in ([old_entry] if old_entry else []) + [{"url": final_url, "original_url": original_url, "etag": etag}]:
+                for key in ("url", "original_url"):
+                    if metadata.get(key) and strong_etag(metadata.get("etag", "")):
+                        alias = {"url": metadata[key].strip(), "etag": metadata["etag"]}
+                        if alias not in aliases:
+                            aliases.append(alias)
+            if old_entry and self._leases.get(sha256_lower, 0):
+                old_entry["aliases"] = aliases
+                if src_path != Path(old_entry["path"]):
+                    src_path.unlink()
+                self._rebuild_indices()
+                self._persist_index()
+                return True
 
             # Destination filename in cache: <sha256>_<sanitized_basename>
             sanitized_name = Path(filename).name
@@ -381,12 +407,14 @@ class CacheManager:
                 "path": str(dest_path),
                 "url": final_url.strip(),
                 "original_url": resolved_original_url,
-                "etag": normalize_etag(etag),
+                "etag": etag.strip() if strong_etag(etag) else "",
+                "validator_version": 2,
                 "filename": sanitized_name,
                 "size": dest_stat.st_size,
                 "mtime": dest_stat.st_mtime,
                 "mtime_ns": dest_stat.st_mtime_ns,
                 "last_access": now,
+                "aliases": aliases,
             }
 
             self._dedupe_paths()
@@ -398,6 +426,7 @@ class CacheManager:
             logger.error(f"Error in register_completed (download remains successful): {exc}")
             return False
 
+    @synchronized
     def update_alias(self, sha256: str, new_filename: str) -> bool:
         """
         Updates the cached filename alias for an existing entry:
@@ -413,6 +442,8 @@ class CacheManager:
             return False
 
         entry = self.approved_hash_map[sha_lower]
+        if self._leases.get(sha_lower, 0):
+            return True  # Never rename an active stream's file.
         sanitized_name = Path(new_filename).name.strip()
         if not sanitized_name:
             return False
@@ -455,6 +486,7 @@ class CacheManager:
             logger.error(f"Failed to update cache alias: {e}")
             return False
 
+    @synchronized
     def lookup(self, url: str, etag: str = "") -> dict:
         """
         Safeguard #6: Stale Cache Prevention via ETag Verification.
@@ -463,6 +495,8 @@ class CacheManager:
         Updates last_access on hit (Finding 12).
         """
         target_url = url.strip()
+        if not strong_etag(etag):
+            return {"hit": False}
         norm_etag = normalize_etag(etag)
 
         # 1. O(1) Index Lookup
@@ -485,6 +519,7 @@ class CacheManager:
             path = Path(entry["path"])
             if path.exists():
                 entry["last_access"] = time.time()
+                self._persist_index()
                 return {
                     "hit": True,
                     "sha256": target_sha,
@@ -498,6 +533,7 @@ class CacheManager:
 
         return {"hit": False}
 
+    @synchronized
     def stream_path(self, sha256: str) -> Optional[Path]:
         """
         Safeguard #7: Zero Path Traversal (SHA-256 Hash-Only Serving).
@@ -528,8 +564,10 @@ class CacheManager:
 
         # Update last_access timestamp (Finding 12)
         entry["last_access"] = time.time()
+        self._persist_index()
         return path
 
+    @synchronized
     def list_items(self) -> dict:
         """Lists all items in the cache index without exposing absolute server paths (F4)."""
         sanitized_items = [
@@ -551,6 +589,51 @@ class CacheManager:
             "max_cache_bytes": self.max_cache_bytes,
             "items": sanitized_items,
         }
+
+    def _evict_to_fit(self, incoming, exclude=None):
+        self._rebuild_indices()
+        candidates = sorted(self.approved_hash_map, key=lambda sha: self.approved_hash_map[sha].get("last_access", 0))
+        for sha in candidates:
+            if self._total_bytes + incoming <= self.max_cache_bytes:
+                return True
+            if sha == exclude or self._leases.get(sha, 0):
+                continue
+            try:
+                Path(self.approved_hash_map[sha]["path"]).unlink(missing_ok=True)
+            except OSError:
+                continue
+            self.approved_hash_map.pop(sha)
+            self._rebuild_indices()
+        return self._total_bytes + incoming <= self.max_cache_bytes
+
+    @contextmanager
+    def lease(self, sha256, verify=True):
+        with self._lock:
+            path = self.stream_path(sha256)
+            if path is None or (verify and compute_file_sha256(path) != sha256):
+                raise FileNotFoundError("Cached file missing or corrupt")
+            self._leases[sha256] = self._leases.get(sha256, 0) + 1
+        try:
+            yield path
+        finally:
+            with self._lock:
+                self._leases[sha256] -= 1
+
+    def copy_verified(self, sha256, destination):
+        with self.lease(sha256) as source:
+            shutil.copyfile(source, destination)
+            if compute_file_sha256(destination) != sha256:
+                Path(destination).unlink(missing_ok=True)
+                raise ValueError("Cached copy failed SHA-256 verification")
+        return Path(destination).stat().st_size
+
+    @synchronized
+    def find_by_sha(self, sha256):
+        entry = self.approved_hash_map.get(sha256)
+        return {"hit": True, "sha256": sha256, "size": entry["size"]} if entry else {"hit": False}
+
+    def flush(self):
+        self._persist_index()
 
 
 # Lazy singleton fallback instance (Finding 16: zero scan on module import)

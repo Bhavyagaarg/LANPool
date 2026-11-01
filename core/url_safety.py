@@ -1,82 +1,69 @@
-"""
-LANPool URL Safety & SSRF Validator (core/url_safety.py)
-Validates download targets and redirect targets to prevent SSRF and internal network scanning.
-Enforces scheme checks, rejects userinfo, resolves hostnames to IPs, and rejects
-unspecified, multicast, broadcast, link-local, and loopback (unless explicitly allowed).
-"""
-
+"""Origin URL policy and a transport that connects to the IP it validated."""
 import asyncio
 import ipaddress
-import urllib.parse
+import socket
+from urllib.parse import urlsplit
+import httpx
+from config import ALLOW_LOOPBACK_DOWNLOADS, ALLOW_PRIVATE_DOWNLOADS, REQUEST_TIMEOUT_SECONDS
 
 
-async def validate_download_url(url: str, allow_loopback: bool = True) -> str:
-    """
-    Asynchronously validates a download URL for safety against SSRF.
-    Raises ValueError with a descriptive message if the URL violates safety policies.
-    """
-    if not url or not isinstance(url, str):
-        raise ValueError("URL must be a non-empty string.")
-
-    parsed = urllib.parse.urlsplit(url.strip())
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise ValueError(f"Invalid URL scheme '{parsed.scheme}'. Only HTTP and HTTPS are permitted.")
-
-    if not parsed.netloc:
-        raise ValueError("URL must contain a host.")
-
-    if parsed.username or parsed.password:
-        raise ValueError("URLs containing userinfo (username/password) are forbidden.")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise ValueError("URL must contain a valid hostname or IP address.")
-
-    loop = asyncio.get_running_loop()
-
-    # Check if host is an IP literal
+async def resolve_download_url(url, allow_loopback=False, allow_private=None):
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string")
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only absolute HTTP(S) URLs are allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are forbidden")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid destination port")
+    allow_private = ALLOW_PRIVATE_DOWNLOADS if allow_private is None else allow_private
     try:
-        ip_obj = ipaddress.ip_address(hostname)
-        ips = [ip_obj]
+        addresses = [ipaddress.ip_address(parsed.hostname)]
     except ValueError:
-        # Hostname: resolve via getaddrinfo
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-        import socket
         try:
-            addr_info = await loop.getaddrinfo(
-                hostname,
-                port,
-                family=0,
-                type=socket.SOCK_STREAM,
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to resolve host '{hostname}': {e}")
+            rows = await asyncio.get_running_loop().getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+            addresses = list({ipaddress.ip_address(row[4][0]) for row in rows})
+        except OSError as exc:
+            raise ValueError("Could not resolve destination") from exc
+    if not addresses:
+        raise ValueError("No destination addresses")
+    for address in addresses:
+        address = getattr(address, "ipv4_mapped", None) or address
+        if address.is_unspecified or address.is_multicast or address.is_link_local or (address.is_reserved and not address.is_loopback) or str(address) == "255.255.255.255":
+            raise ValueError("Forbidden destination address")
+        if address.is_loopback:
+            if not allow_loopback:
+                raise ValueError("Loopback origin is disabled")
+        elif not address.is_global and not allow_private:
+            raise ValueError("Private/internal origin is disabled")
+    return str(addresses[0])
 
-        if not addr_info:
-            raise ValueError(f"Could not resolve any IP address for host '{hostname}'.")
 
-        ips = []
-        for item in addr_info:
-            sockaddr = item[4]
-            ip_str = sockaddr[0]
-            try:
-                ips.append(ipaddress.ip_address(ip_str))
-            except ValueError:
-                pass
+async def validate_download_url(url, allow_loopback=False, allow_private=None):
+    await resolve_download_url(url, allow_loopback, allow_private)
+    return url.strip()
 
-    if not ips:
-        raise ValueError(f"No valid IP addresses resolved for '{hostname}'.")
 
-    for ip in ips:
-        if ip.is_unspecified:
-            raise ValueError(f"Forbidden destination: '{hostname}' resolves to unspecified address ({ip}).")
-        if ip.is_multicast:
-            raise ValueError(f"Forbidden destination: '{hostname}' resolves to multicast address ({ip}).")
-        if ip.is_link_local:
-            raise ValueError(f"Forbidden destination: '{hostname}' resolves to link-local address ({ip}).")
-        if str(ip) == "255.255.255.255":
-            raise ValueError(f"Forbidden destination: '{hostname}' resolves to broadcast address ({ip}).")
-        if ip.is_loopback and not allow_loopback:
-            raise ValueError(f"Forbidden destination: '{hostname}' resolves to loopback address ({ip}) and loopback is disabled.")
+class PinnedOriginTransport(httpx.AsyncBaseTransport):
+    """No proxy or second DNS lookup; retain Host and TLS certificate hostname."""
+    def __init__(self):
+        self.transports = {}
 
-    return url
+    async def handle_async_request(self, request):
+        address = await resolve_download_url(str(request.url), ALLOW_LOOPBACK_DOWNLOADS)
+        headers = request.headers.copy()
+        headers["Host"] = request.url.netloc.decode("ascii")
+        pinned = httpx.Request(request.method, request.url.copy_with(host=address), headers=headers, stream=request.stream, extensions={**request.extensions, "sni_hostname": request.url.host})
+        key = (request.url.scheme, request.url.host, request.url.port)
+        if key not in self.transports:
+            self.transports[key] = httpx.AsyncHTTPTransport(trust_env=False)
+        return await self.transports[key].handle_async_request(pinned)
+
+    async def aclose(self):
+        await asyncio.gather(*(transport.aclose() for transport in self.transports.values()))
+
+
+def origin_client(timeout=REQUEST_TIMEOUT_SECONDS):
+    return httpx.AsyncClient(transport=PinnedOriginTransport(), timeout=timeout, trust_env=False, follow_redirects=False)

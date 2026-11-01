@@ -5,6 +5,15 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _closing_response(response):
+    try:
+        yield response
+    finally:
+        await response.aclose()
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse
@@ -27,7 +36,11 @@ from config import (
 from core.cache_manager import CacheManager, default_cache_manager, normalize_etag
 from core.net_utils import verify_disk_space_or_raise
 from core.peer_registry import PeerRegistry
-from core.url_safety import validate_download_url
+from core.url_safety import validate_download_url, origin_client
+from core.peer_auth import signed_request, verify_content, send_bounded, read_bounded, peer_client, peer_url
+from config import PEER_SECRET, BOOST_THRESHOLD_MB
+from core.cache_manager import strong_etag
+from core.io_utils import disk_call, acquire_resource
 from core.worker import PoisonedChunkError, RemoteContentChangedError, format_if_range
 
 logger = logging.getLogger("LANPool.Downloader")
@@ -73,11 +86,11 @@ async def probe_url(
     Fails fast if Content-Range is wildcard or total size cannot be determined.
     """
     created_client = client is None
-    c = client or httpx.AsyncClient(timeout=timeout)
+    c = client or origin_client(timeout)
 
     current_url = url.strip()
     max_redirects = 5
-    headers = {"User-Agent": "LANPool-SoloDownloader/1.0", "Range": "bytes=0-0"}
+    headers = {"User-Agent": "LANPool/1.1", "Range": "bytes=0-0", "Accept-Encoding": "identity"}
 
     try:
         for _ in range(max_redirects + 1):
@@ -101,7 +114,7 @@ async def probe_url(
                 if status == 206:
                     cr = response.headers.get("Content-Range", "").strip()
                     # Expect: bytes 0-0/<number>
-                    match = re.search(r"bytes\s+0-0/(\d+)", cr)
+                    match = re.fullmatch(r"bytes 0-0/(\d+)", cr)
                     if match:
                         total_size = int(match.group(1))
                         accept_ranges = True
@@ -128,6 +141,7 @@ async def probe_url(
                     "total_size": total_size,
                     "etag": etag,
                     "accept_ranges": accept_ranges,
+                    "probe_bytes": 0,  # response body is deliberately not consumed
                 }
 
         raise ValueError("Exceeded maximum redirect limit (5 hops).")
@@ -174,6 +188,11 @@ class SoloDownloadTask:
         peer_registry: Optional[PeerRegistry] = None,
         api_token: str = "",
         own_node_id: str = "",
+        expected_sha256: str = "",
+        offline: bool = False,
+        on_state_change=None,
+        use_cache=True,
+        use_peers=True,
     ):
         self.job_id = job_id
         self.url = url
@@ -197,6 +216,19 @@ class SoloDownloadTask:
         self.peer_registry = peer_registry
         self.api_token = api_token
         self.own_node_id = own_node_id
+        self.expected_sha256 = expected_sha256.lower().strip()
+        if self.expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", self.expected_sha256):
+            raise ValueError("Expected SHA-256 must contain 64 hex characters")
+        self.offline = offline
+        self.on_state_change = on_state_change
+        self.use_cache = use_cache
+        self.use_peers = use_peers
+        self.helper_origin_bytes = 0
+        self.probe_requests = 0
+        self.origin_received_bytes = 0
+        self._speed_sample = (time.monotonic(), 0, 0, 0)
+        self._speeds = (0.0, 0.0, 0.0)
+        self._wait_handles = []
 
         # Per-job isolated part path (Finding 4)
         self.final_path = self.download_dir / self.filename
@@ -232,7 +264,9 @@ class SoloDownloadTask:
     @staticmethod
     def _derive_filename(url: str) -> str:
         parsed = urlparse(url)
-        name = Path(parsed.path).name.strip()
+        name = re.sub(r'[<>:"|?*\\\x00-\x1f]', "_", Path(parsed.path).name).strip().rstrip(". ")[:180]
+        if name.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+            name = "download_" + name
         if not name or name in ("", "/", ".", ".."):
             name = f"download_{int(time.time())}.bin"
         return name
@@ -244,7 +278,26 @@ class SoloDownloadTask:
         wan_speed_bps = (self.wan_bytes / elapsed) if elapsed > 0 else 0.0
         lan_speed_bps = (self.lan_bytes / elapsed) if elapsed > 0 else 0.0
 
+        sample_now = time.monotonic()
+        previous_time, previous_total, previous_wan, previous_lan = self._speed_sample
+        interval = sample_now - previous_time
+        if interval >= 0.25:
+            self._speeds = tuple(max(0, value - old) / interval / 1048576 for value, old in ((self.downloaded_bytes, previous_total), (self.origin_received_bytes, previous_wan), (self.lan_bytes, previous_lan)))
+            self._speed_sample = (sample_now, self.downloaded_bytes, self.origin_received_bytes, self.lan_bytes)
+        if self.status in ("completed", "failed", "cancelled"):
+            self._speeds = (0.0, 0.0, 0.0)
         return {
+            "speed_mibps": round(self._speeds[0], 3),
+            "wan_speed_mibps": round(self._speeds[1], 3),
+            "lan_speed_mibps": round(self._speeds[2], 3),
+            "average_speed_mibps": round(speed_bps / 1048576, 3),
+            "origin_received_bytes": self.origin_received_bytes,
+            "helper_origin_bytes": self.helper_origin_bytes,
+            "probe_requests": self.probe_requests,
+            "expected_sha256": self.expected_sha256,
+            "offline": self.offline,
+            "use_cache": self.use_cache,
+            "use_peers": self.use_peers,
             "job_id": self.job_id,
             "url": self.url,
             "final_url": self.final_url,
@@ -272,268 +325,157 @@ class SoloDownloadTask:
         self.status = "probing"
         self._task_handle = asyncio.create_task(self._run())
 
-    async def _run(self) -> None:
-        client_provided = self.custom_client is not None
-        client = self.custom_client or httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS)
+    async def cancel(self):
+        if self._task_handle and not self._task_handle.done():
+            self._task_handle.cancel()
+            await asyncio.gather(self._task_handle, return_exceptions=True)
 
+    async def _disk_call(self, function, *args, **kwargs):
+        return await disk_call(function, *args, **kwargs)
+
+    async def _open_file(self, path, mode):
+        return await acquire_resource(lambda: open(path, mode), lambda handle: handle.close())
+
+    def _eligible_peers(self):
+        if not self.use_peers or not PEER_SECRET or not self.peer_registry:
+            return []
+        peers = [p for p in self.peer_registry.list_peers() if p.get("trusted") and p.get("available", True) and p.get("node_id") != self.own_node_id]
+        return sorted(peers, key=lambda peer: (bool(peer.get("game_mode")), -peer.get("share_pct", 0)))
+
+    async def _notify_boost(self, release=False):
+        peers = self._eligible_peers()
+        path = "/api/qos/boost-release" if release else "/api/qos/boost-notify"
+        payload = {"job_id": self.job_id} if release else {"requester_id": self.own_node_id, "requester_ip": "LAN peer", "filename": self.filename, "total_size": self.total_size, "job_id": self.job_id}
+        async def send(peer):
+            try:
+                async with peer_client(3) as c:
+                    request = signed_request(c, "POST", peer_url(peer, path), json=payload)
+                    await c.send(request)
+            except httpx.HTTPError:
+                pass
+        await asyncio.gather(*(send(p) for p in peers))
+
+    async def _use_local(self, cache_mgr, hit):
+        if not hit.get("hit"):
+            return False
+        sha = hit["sha256"]
+        if self.expected_sha256 and sha != self.expected_sha256:
+            return False
         try:
-            # 1. Probe URL
-            probe_info = await probe_url(self.url, client=client)
-            if not probe_info.get("accept_ranges"):
-                raise ValueError("Origin does not support HTTP Range requests; LANPool requires byte ranges.")
-
-            self.final_url = probe_info["final_url"]
-            self.total_size = probe_info["total_size"]
-            self.etag = probe_info["etag"]
-
-            # 2. Pre-flight Disk Space Check (Safeguard #10)
-            verify_disk_space_or_raise(self.download_dir, self.total_size)
-
-            cache_mgr = self.cache_manager or default_cache_manager
-
-            # Phase 1a: Instant local cache lookup
-            if cache_mgr is not None:
-                local_hit = cache_mgr.lookup(self.final_url, self.etag)
-                if local_hit.get("hit"):
-                    cached_sha = local_hit["sha256"]
-                    cached_path = cache_mgr.stream_path(cached_sha)
-                    if cached_path and cached_path.exists():
-                        try:
-                            # Copy through .part, verify size, then atomic replace (Phase 1a Safe Copy)
-                            if self.part_path.exists():
-                                self.part_path.unlink(missing_ok=True)
-                            await asyncio.to_thread(shutil.copyfile, cached_path, self.part_path)
-                            part_size = self.part_path.stat().st_size
-                            if part_size != self.total_size:
-                                raise ValueError(f"Local cache copy size mismatch: expected {self.total_size}, got {part_size}")
-                            os.replace(self.part_path, self.final_path)
-
-                            # Ensure canonical alias in cache dir if requested with distinct filename (keeps Stage 2 T4 & T5 green with 0 orphans)
-                            if self.filename and hasattr(cache_mgr, "update_alias"):
-                                cache_mgr.update_alias(cached_sha, self.filename)
-
-                            self.source = "local_cache"
-                            self.lan_bytes = 0
-                            self.wan_bytes = 0
-                            self.sha256 = cached_sha
-                            self.downloaded_bytes = self.total_size
-                            self.status = "completed"
-                            self.end_time = time.time()
-                            logger.info(f"[{self.job_id}] Phase 1a: Instant local cache hit for {self.filename} (sha={cached_sha[:8]}).")
-                            return
-                        except Exception as copy_err:
-                            logger.warning(f"Local cache copy failed: {copy_err}")
-                            if self.part_path.exists():
-                                self.part_path.unlink(missing_ok=True)
-
-            # Phase 1b: Peer cache lookup & streaming
-            if self.peer_registry is not None:
-                peers = [p for p in self.peer_registry.list_peers() if p.get("node_id") != self.own_node_id]
-                if peers:
-                    peer_hits = await self._query_peer_caches(peers)
-                    for peer, hit_data in peer_hits:
-                        peer_sha = hit_data.get("sha256")
-                        if not peer_sha:
-                            continue
-                        stream_ok = await self._stream_from_peer_cache(peer, peer_sha)
-                        if stream_ok:
-                            os.replace(self.part_path, self.final_path)
-                            try:
-                                if cache_mgr:
-                                    cache_mgr.register_completed(
-                                        file_path=self.final_path,
-                                        final_url=self.final_url,
-                                        etag=self.etag,
-                                        sha256=peer_sha,
-                                        filename=self.filename,
-                                        size=self.total_size,
-                                        original_url=self.url,
-                                    )
-                            except Exception as reg_exc:
-                                logger.warning(f"Cache registration failed: {reg_exc}")
-                            self.source = "peer_cache"
-                            self.lan_bytes = self.total_size
-                            self.wan_bytes = 0
-                            self.sha256 = peer_sha
-                            self.downloaded_bytes = self.total_size
-                            self.status = "completed"
-                            self.end_time = time.time()
-                            logger.info(f"[{self.job_id}] Phase 1b: Completed via peer cache on {peer.get('node_id')} (sha={peer_sha[:8]}).")
-                            return
-                        else:
-                            if self.part_path.exists():
-                                self.part_path.unlink(missing_ok=True)
-
-            # Phase 2: Pooled Chunks (Self workers + Helper workers)
-            # 3. Dynamic Micro-Chunk Generator (Safeguard #1)
-            self._generate_chunks()
-
-            # 4. Start Single Dedicated Disk-Writer Task (Safeguard #2)
-            self.status = "downloading"
-            self._writer_handle = asyncio.create_task(
-                self._disk_writer_task(),
-                name="lanpool-disk-writer",
-            )
-
-            # 5. Start Concurrent Network & Helper Workers
-            total_workers = min(self.num_workers, len(self.chunks)) if self.chunks else 1
-            active_peers = [
-                p for p in (self.peer_registry.list_peers() if self.peer_registry else [])
-                if p.get("node_id") != self.own_node_id and p.get("share_pct", 30) > 0
-            ]
-            num_helpers = min(len(active_peers), total_workers - 1) if active_peers and total_workers > 1 else 0
-            num_self = total_workers - num_helpers
-            self.source = "pooled" if num_helpers > 0 else "solo"
-
-            for i in range(num_self):
-                w = asyncio.create_task(
-                    self._network_worker(worker_id=f"self-{i+1}", client=client),
-                    name=f"lanpool-self-worker-{i+1}",
-                )
-                self._worker_handles.append(w)
-
-            for i, peer in enumerate(active_peers[:num_helpers]):
-                w = asyncio.create_task(
-                    self._helper_worker(peer),
-                    name=f"lanpool-helper-{peer.get('node_id', '')[:8]}",
-                )
-                self._worker_handles.append(w)
-
-            # Wait on chunk_queue.join(), writer_handle, or fatal_event (Finding 1, 3)
-            join_task = asyncio.create_task(self.chunk_queue.join())
-            fatal_task = asyncio.create_task(self.fatal_event.wait())
-
-            done, pending = await asyncio.wait(
-                [join_task, self._writer_handle, fatal_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            # If fatal event occurred or writer failed prematurely:
-            if fatal_task in done or (self._writer_handle in done and self._writer_error is not None):
-                # Cancel helper tasks, but NOT writer handle
-                if join_task in pending:
-                    join_task.cancel()
-                if fatal_task in pending:
-                    fatal_task.cancel()
-
-                # Stop network workers immediately so they stop pushing to writer_queue
-                for w in self._worker_handles:
-                    w.cancel()
-                await asyncio.gather(*self._worker_handles, return_exceptions=True)
-
-                # Cleanly signal disk writer and await termination (Finding 1, 3)
-                if self._writer_handle and not self._writer_handle.done():
-                    try:
-                        while self.writer_queue.full():
-                            try:
-                                self.writer_queue.get_nowait()
-                                self.writer_queue.task_done()
-                            except (asyncio.QueueEmpty, ValueError):
-                                break
-                        await self.writer_queue.put(None)
-                        await asyncio.wait_for(self._writer_handle, timeout=3.0)
-                    except Exception:
-                        if not self._writer_handle.done():
-                            self._writer_handle.cancel()
-                elif self._writer_handle and self._writer_handle.done():
-                    try:
-                        _ = self._writer_handle.exception()
-                    except Exception:
-                        pass
-
-                # Drain queues so no worker remains blocked
-                while not self.chunk_queue.empty():
-                    try:
-                        self.chunk_queue.get_nowait()
-                        self.chunk_queue.task_done()
-                    except (asyncio.QueueEmpty, ValueError):
-                        break
-
-                while not self.writer_queue.empty():
-                    try:
-                        self.writer_queue.get_nowait()
-                        self.writer_queue.task_done()
-                    except (asyncio.QueueEmpty, ValueError):
-                        break
-
-                err_msg = self.error or (str(self._writer_error) if self._writer_error else "Download failed.")
-                raise RuntimeError(err_msg)
-
-            # Normal completion flow:
-            for w in self._worker_handles:
-                w.cancel()
-            await asyncio.gather(*self._worker_handles, return_exceptions=True)
-
-            # Cleanly signal disk writer and await termination
-            await self.writer_queue.put(None)
-            if self._writer_handle:
-                await self._writer_handle
-
-            # Clean up pending helper tasks
-            for p in pending:
-                p.cancel()
-
-            # Ensure all chunks actually succeeded
-            if not all(c.status == "done" for c in self.chunks):
-                raise RuntimeError("Download queue unblocked but not all chunks were completed.")
-
-            # 6. Verify completion and atomic rename
-            if self.part_path.exists():
-                os.replace(self.part_path, self.final_path)
-
-                # Register in cache
-                try:
-                    cache_mgr = self.cache_manager or default_cache_manager
-                    cache_mgr.register_completed(
-                        file_path=self.final_path,
-                        final_url=self.final_url,
-                        etag=self.etag,
-                        sha256=self.sha256 or "",
-                        filename=self.filename,
-                        size=self.total_size,
-                        original_url=self.url,
-                    )
-                except Exception as reg_exc:
-                    logger.warning(f"Cache registration failed (download completed): {reg_exc}")
-
-                self.status = "completed"
-                self.end_time = time.time()
-            else:
-                raise FileNotFoundError(f"Expected part file {self.part_path} was not created.")
-
-        except Exception as exc:
-            self.status = "failed"
-            self.error = self.error or str(exc)
+            size = await self._disk_call(cache_mgr.copy_verified, sha, self.part_path)
+            if self.total_size and size != self.total_size:
+                raise ValueError("Cached size does not match origin")
+            await self._disk_call(os.replace, self.part_path, self.final_path)
+            await self._disk_call(cache_mgr.update_alias, sha, self.filename)
+            self.total_size = self.downloaded_bytes = size
+            self.sha256, self.source, self.status = sha, "local_cache", "completed"
             self.end_time = time.time()
+            return True
+        except (OSError, ValueError) as exc:
+            logger.warning("Ignoring missing/corrupt cache: %s", exc)
+            await self._disk_call(self.part_path.unlink, missing_ok=True)
+            return False
 
-            # Ensure workers and writer are halted
-            for w in self._worker_handles:
-                w.cancel()
-            if self._writer_handle and not self._writer_handle.done():
-                try:
-                    while self.writer_queue.full():
-                        try:
-                            self.writer_queue.get_nowait()
-                            self.writer_queue.task_done()
-                        except (asyncio.QueueEmpty, ValueError):
-                            break
-                    await self.writer_queue.put(None)
-                    await asyncio.wait_for(self._writer_handle, timeout=3.0)
-                except Exception:
-                    if not self._writer_handle.done():
-                        self._writer_handle.cancel()
-
+    async def _run(self):
+        client = self.custom_client or origin_client()
+        boosted = False
+        cache_mgr = self.cache_manager or default_cache_manager
+        try:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+            if self.offline:
+                if not self.expected_sha256:
+                    raise ValueError("Offline mode requires a trusted expected SHA-256")
+                hit = await self._disk_call(cache_mgr.find_by_sha, self.expected_sha256)
+                if not await self._use_local(cache_mgr, hit):
+                    raise ValueError("Verified offline content is not available in this node's cache")
+                return
+            self.probe_requests += 1
+            probe = await probe_url(self.url, client=client)
+            if not probe["accept_ranges"]:
+                raise ValueError("Origin must support HTTP byte ranges")
+            self.final_url, self.total_size, self.etag = probe["final_url"], probe["total_size"], probe["etag"]
+            await self._disk_call(verify_disk_space_or_raise, self.download_dir, self.total_size)
+            if not strong_etag(self.etag) and self.total_size > self.chunk_size and not self.expected_sha256:
+                raise ValueError("Multi-chunk downloads require a strong ETag or a trusted expected SHA-256")
+            hit = await self._disk_call(cache_mgr.lookup, self.final_url, self.etag) if self.use_cache else {"hit": False}
+            if await self._use_local(cache_mgr, hit):
+                return
+            if self.use_cache and strong_etag(self.etag):
+                for peer, hit in await self._query_peer_caches(self._eligible_peers()):
+                    sha = hit.get("sha256", "")
+                    if self.expected_sha256 and sha != self.expected_sha256:
+                        continue
+                    if await self._stream_from_peer_cache(peer, sha):
+                        self.sha256, self.source = sha, "peer_cache"
+                        self.downloaded_bytes = self.lan_bytes = self.total_size
+                        await self._publish(cache_mgr)
+                        return
+                    self.downloaded_bytes = self.lan_bytes = 0
+                    await self._disk_call(self.part_path.unlink, missing_ok=True)
+            self._generate_chunks()
+            self.status = "downloading"
+            self._writer_handle = asyncio.create_task(self._disk_writer_task(), name="lanpool-disk-writer")
+            peers = [p for p in self._eligible_peers() if p.get("share_pct", 0) > 0]
+            count = min(self.num_workers, len(self.chunks))
+            helpers = min(len(peers), max(0, count - 1))
+            self.source = "pooled" if helpers else "solo"
+            if helpers and self.total_size >= BOOST_THRESHOLD_MB * 1048576:
+                boosted = True
+                await self._notify_boost()
+            for i in range(count - helpers):
+                self._worker_handles.append(asyncio.create_task(self._network_worker(f"self-{i+1}", client), name="lanpool-self-worker"))
+            for peer in peers[:helpers]:
+                self._worker_handles.append(asyncio.create_task(self._helper_worker(peer), name="lanpool-helper-worker"))
+            join = asyncio.create_task(self.chunk_queue.join(), name="lanpool-chunk-join")
+            fatal = asyncio.create_task(self.fatal_event.wait(), name="lanpool-fatal-wait")
+            self._wait_handles = [join, fatal]
+            done, _ = await asyncio.wait([join, fatal, self._writer_handle], return_when=asyncio.FIRST_COMPLETED)
+            if fatal in done or self._writer_handle in done:
+                raise RuntimeError(self.error or str(self._writer_error or "Writer stopped prematurely"))
+            for worker in self._worker_handles:
+                worker.cancel()
+            await asyncio.gather(*self._worker_handles, return_exceptions=True)
+            await self.writer_queue.put(None)
+            await self._writer_handle
+            if not all(chunk.status == "done" for chunk in self.chunks):
+                raise RuntimeError("Some chunks were not written")
+            await self._publish(cache_mgr)
+        except asyncio.CancelledError:
+            self.status, self.error = "cancelled", "Cancelled; retry starts a new verified download"
+            self.end_time = time.time()
+            raise
+        except Exception as exc:
+            self.status, self.error = "failed", self.error or str(exc)
+            self.end_time = time.time()
         finally:
-            if not client_provided:
-                await client.aclose()
-
-            # Finding 5: Unlink .part on failure or abnormal exit
-            if self.status != "completed" and self.part_path.exists():
+            if self._writer_handle and not self._writer_handle.done() and not asyncio.current_task().cancelling():
                 try:
-                    self.part_path.unlink()
-                    logger.info(f"Cleaned up part file on failure: {self.part_path.name}")
-                except Exception as unl_exc:
-                    logger.warning(f"Failed to unlink part file {self.part_path}: {unl_exc}")
+                    await asyncio.wait_for(self.writer_queue.put(None), timeout=1)
+                    await asyncio.wait_for(asyncio.shield(self._writer_handle), timeout=3)
+                except (Exception, asyncio.CancelledError):
+                    pass
+            children = [*self._worker_handles, *self._wait_handles]
+            if self._writer_handle:
+                children.append(self._writer_handle)
+            for child in children:
+                if not child.done():
+                    child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
+            if self.custom_client is None:
+                await client.aclose()
+            if self.status != "completed":
+                await self._disk_call(self.part_path.unlink, missing_ok=True)
+            if boosted:
+                await self._notify_boost(release=True)
+            if self.on_state_change:
+                await self.on_state_change()
+
+    async def _publish(self, cache_mgr):
+        if self.expected_sha256 and self.sha256 != self.expected_sha256:
+            raise ValueError("Final SHA-256 does not match the trusted expected hash")
+        await self._disk_call(os.replace, self.part_path, self.final_path)
+        await self._disk_call(cache_mgr.register_completed, self.final_path, self.final_url, self.etag, self.sha256, self.filename, self.total_size, original_url=self.url)
+        self.status, self.end_time = "completed", time.time()
 
     def _generate_chunks(self) -> None:
         """Slices total_size into 10 MB micro-chunks."""
@@ -548,191 +490,117 @@ class SoloDownloadTask:
             start = end + 1
             chunk_id += 1
 
-    async def _disk_writer_task(self) -> None:
-        """
-        Safeguard #2: WinError 32 Guard & Finding 3: Dead writer detection.
-        Single dedicated task that writes chunk data to disk.
-        """
-        self.part_path.parent.mkdir(parents=True, exist_ok=True)
-
+    async def _disk_writer_task(self):
+        handle = await self._open_file(self.part_path, "wb+")
+        def write(offset, data):
+            handle.seek(offset)
+            handle.write(data)
+            handle.flush()
         try:
-            with open(self.part_path, "wb+") as f:
-                while True:
-                    item = await self.writer_queue.get()
+            while True:
+                item = await self.writer_queue.get()
+                try:
                     if item is None:
-                        self.writer_queue.task_done()
                         break
-
-                    chunk_id, start_byte, raw_bytes = item
-                    try:
-                        f.seek(start_byte)
-                        f.write(raw_bytes)
-                        f.flush()
-
-                        chunk = self.chunks[chunk_id]
-                        chunk.status = "done"
-                        chunk.downloaded_bytes = len(raw_bytes)
-                        self.downloaded_bytes += len(raw_bytes)
-                        if (chunk.worker_id or "").startswith("helper-"):
-                            self.lan_bytes += len(raw_bytes)
-                        else:
-                            self.wan_bytes += len(raw_bytes)
-                    finally:
-                        self.writer_queue.task_done()
-
-                f.flush()
-                f.seek(0)
-                hasher = hashlib.sha256()
-                while block := f.read(65536):
-                    hasher.update(block)
-                self.sha256 = hasher.hexdigest()
-
+                    chunk_id, offset, data = item
+                    await self._disk_call(write, offset, data)
+                    chunk = self.chunks[chunk_id]
+                    chunk.status, chunk.downloaded_bytes = "done", len(data)
+                    self.downloaded_bytes += len(data)
+                    if (chunk.worker_id or "").startswith("helper-"):
+                        self.lan_bytes += len(data)
+                    else:
+                        self.wan_bytes += len(data)
+                finally:
+                    self.writer_queue.task_done()
+            self.sha256 = await self._disk_call(compute_file_sha256, self.part_path)
         except Exception as exc:
             self._writer_error = exc
             self.fatal_event.set()
-            logger.error(f"Disk writer encountered error on {self.part_path.name}: {exc}")
             raise
+        finally:
+            await self._disk_call(handle.close)
 
-    async def _network_worker(self, worker_id: str, client: httpx.AsyncClient) -> None:
-        """
-        Fetches micro-chunks using HTTP 206 Range requests.
-        Enforces ETag pinning (Finding 15) and bounded retries (Finding 1).
-        """
+    async def _network_worker(self, worker_id, client):
+        from core.worker import fetch_chunk_from_origin
+        def received(size):
+            self.origin_received_bytes += size
         while not self.fatal_event.is_set():
+            chunk = await self.chunk_queue.get()
+            chunk.worker_id, chunk.status = worker_id, "downloading"
             try:
-                chunk = await self.chunk_queue.get()
+                data, _ = await fetch_chunk_from_origin(self.final_url, chunk.start_byte, chunk.end_byte, self.etag, client=client, total_size=self.total_size, on_bytes=received)
+                await self.writer_queue.put((chunk.chunk_id, chunk.start_byte, data))
             except asyncio.CancelledError:
-                break
-
-            chunk.worker_id = worker_id
-            chunk.status = "downloading"
-
-            headers = {
-                "User-Agent": "LANPool-SoloDownloader/1.0",
-                "Range": f"bytes={chunk.start_byte}-{chunk.end_byte}",
-            }
-
-            # Finding 15: ETag Pinning with If-Range
-            if self.etag:
-                wire_etag = self.etag.strip()
-                if not wire_etag.startswith('"') and not wire_etag.startswith("W/"):
-                    wire_etag = f'"{wire_etag}"'
-                if not wire_etag.startswith("W/"):
-                    headers["If-Range"] = wire_etag
-
-            try:
-                resp = await client.get(
-                    self.final_url,
-                    headers=headers,
-                    follow_redirects=False,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-
-                # Check for unexpected redirect (poison)
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    raise PoisonedChunkError(f"Unexpected redirect HTTP {resp.status_code} during chunk download.")
-
-                # Finding 15: Remote content changed check
-                if "If-Range" in headers and resp.status_code == 200:
-                    raise RemoteContentChangedError("Remote content changed during download (HTTP 200 returned for range request).")
-
-                resp_etag = resp.headers.get("ETag", "").strip()
-                if self.etag and resp_etag:
-                    if normalize_etag(resp_etag) != normalize_etag(self.etag):
-                        raise RemoteContentChangedError(f"Remote ETag changed from {self.etag} to {resp_etag}")
-
-                if resp.status_code != 206:
-                    raise PoisonedChunkError(
-                        f"Expected HTTP 206 for byte range {chunk.start_byte}-{chunk.end_byte}, got {resp.status_code}"
-                    )
-
-                if len(resp.content) != chunk.expected_length:
-                    raise PoisonedChunkError(
-                        f"Expected {chunk.expected_length} bytes, received {len(resp.content)} bytes"
-                    )
-
-                # Feed to disk writer queue (bounded)
-                await self.writer_queue.put((chunk.chunk_id, chunk.start_byte, resp.content))
-                self.chunk_queue.task_done()
-
-            except asyncio.CancelledError:
-                chunk.status = "requeued"
-                self.chunk_queue.task_done()
-                break
-
-            except RemoteContentChangedError as rce:
+                chunk.status = "cancelled"
+                raise
+            except RemoteContentChangedError as exc:
+                self.error = str(exc)
                 chunk.status = "poisoned"
-                self.chunk_queue.task_done()
-                self.error = str(rce)
                 self.fatal_event.set()
-                logger.error(f"Fatal download abort: {rce}")
-                break
-
             except Exception as exc:
-                chunk.status = "poisoned"
                 chunk.retries += 1
-
-                # Finding 1: Check bounded retry limit
                 if chunk.retries >= MAX_CHUNK_RETRIES:
-                    self.chunk_queue.task_done()
-                    self.error = f"Chunk {chunk.chunk_id} exceeded max retries ({MAX_CHUNK_RETRIES}): {exc}"
+                    self.error = f"Chunk {chunk.chunk_id} exceeded max retries: {exc}"
+                    chunk.status = "poisoned"
                     self.fatal_event.set()
-                    logger.error(self.error)
-                    break
                 else:
-                    await asyncio.sleep(0.05)
                     chunk.status = "requeued"
-                    await self.chunk_queue.put(chunk)
-                    self.chunk_queue.task_done()
+                    self.chunk_queue.put_nowait(chunk)
+                    await asyncio.sleep(0.05)
+            finally:
+                self.chunk_queue.task_done()
 
-    async def _query_peer_caches(self, peers: List[dict]) -> List[Tuple[dict, dict]]:
-        """Queries active peers in parallel for cache lookup (Phase 1b)."""
-        headers = {}
-        if self.api_token:
-            headers["X-LANPool-Token"] = self.api_token
-
-        async def _check_peer(peer: dict):
-            pip = peer.get("ip") or peer.get("lan_ip")
-            pport = peer.get("port") or peer.get("http_port")
-            url = f"http://{pip}:{pport}/api/cache/lookup"
+    async def _query_peer_caches(self, peers):
+        async def query(peer):
+            if not PEER_SECRET or not peer.get("trusted") or not peer.get("available", True):
+                return None
             try:
-                async with httpx.AsyncClient(timeout=PEER_LOOKUP_TIMEOUT_SECONDS) as c:
-                    r = await c.get(url, params={"url": self.final_url, "etag": self.etag}, headers=headers)
-                    if r.status_code == 200:
-                        data = r.json()
+                async with peer_client(PEER_LOOKUP_TIMEOUT_SECONDS) as client:
+                    request = signed_request(client, "GET", peer_url(peer, "/api/cache/lookup"), params={"url": self.final_url, "etag": self.etag})
+                    response = await send_bounded(client, request)
+                    if response.status_code == 200 and verify_content(hashlib.sha256(response.content).hexdigest(), response.headers.get("X-LANPool-Content-Signature", "")):
+                        data = response.json()
                         if data.get("hit"):
-                            return (peer, data)
-            except Exception:
+                            return peer, data
+            except (httpx.HTTPError, ValueError):
                 pass
             return None
+        results = await asyncio.gather(*(query(p) for p in peers))
+        return [result for result in results if result]
 
-        results = await asyncio.gather(*[_check_peer(p) for p in peers], return_exceptions=True)
-        return [res for res in results if isinstance(res, tuple) and res[0] is not None]
+    @asynccontextmanager
+    async def _async_file(self, path, mode):
+        handle = await self._open_file(path, mode)
+        try:
+            yield handle
+        finally:
+            await self._disk_call(handle.close)
 
     async def _stream_from_peer_cache(self, peer: dict, sha256: str) -> bool:
         """Streams a completed cached file from a peer, verifying exact length and SHA-256."""
         pip = peer.get("ip") or peer.get("lan_ip")
         pport = peer.get("port") or peer.get("http_port")
-        url = f"http://{pip}:{pport}/api/cache/stream/{sha256}"
-        headers = {}
-        if self.api_token:
-            headers["X-LANPool-Token"] = self.api_token
+        url = peer_url(peer, f"/api/cache/stream/{sha256}")
+        headers = {}  # Admin credentials must never be forwarded to peers.
 
         try:
             hasher = hashlib.sha256()
             bytes_written = 0
             self.part_path.parent.mkdir(parents=True, exist_ok=True)
-            async with httpx.AsyncClient(timeout=PEER_STREAM_TIMEOUT_SECONDS) as c:
-                async with c.stream("GET", url, headers=headers) as resp:
-                    if resp.status_code != 200:
+            async with peer_client(PEER_STREAM_TIMEOUT_SECONDS) as c:
+                request = signed_request(c, "GET", url)
+                resp = await c.send(request, stream=True)
+                async with _closing_response(resp):
+                    if resp.status_code != 200 or not verify_content(sha256, resp.headers.get("X-LANPool-Content-Signature", "")):
                         return False
-                    with open(self.part_path, "wb") as f:
+                    async with self._async_file(self.part_path, "wb") as f:
                         async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                             bytes_written += len(chunk)
                             if bytes_written > self.total_size:
                                 logger.warning(f"Peer cache stream exceeded expected total size ({self.total_size})")
                                 return False
-                            f.write(chunk)
+                            await self._disk_call(f.write, chunk)
                             hasher.update(chunk)
                             self.downloaded_bytes = bytes_written
 
@@ -761,14 +629,12 @@ class SoloDownloadTask:
         peer_port = peer.get("port") or peer.get("http_port")
         peer_id = peer.get("node_id", "unknown")
         worker_id = f"helper-{peer_id[:8]}"
-        url = f"http://{peer_ip}:{peer_port}/api/worker/fetch-chunk"
+        url = peer_url(peer, "/api/worker/fetch-chunk")
 
-        headers = {}
-        if self.api_token:
-            headers["X-LANPool-Token"] = self.api_token
+        headers = {}  # Admin credentials must never be forwarded to peers.
 
         consecutive_errors = 0
-        async with httpx.AsyncClient(timeout=HELPER_TIMEOUT_SECONDS) as helper_client:
+        async with peer_client(HELPER_TIMEOUT_SECONDS) as helper_client:
             while not self.fatal_event.is_set():
                 try:
                     chunk = await self.chunk_queue.get()
@@ -784,12 +650,15 @@ class SoloDownloadTask:
                     "end_byte": chunk.end_byte,
                     "chunk_id": chunk.chunk_id,
                     "etag": self.etag,
+                    "total_size": self.total_size,
                 }
 
                 try:
-                    async with helper_client.stream("POST", url, json=payload, headers=headers) as resp:
+                    request = signed_request(helper_client, "POST", url, json=payload)
+                    response = await helper_client.send(request, stream=True)
+                    async with _closing_response(response) as resp:
                         if resp.status_code == 409:
-                            resp_text = (await resp.aread()).decode(errors="replace")
+                            resp_text = (await read_bounded(resp)).decode(errors="replace")
                             self.error = f"Remote content changed on helper {peer_id}: {resp_text}"
                             self.fatal_event.set()
                             chunk.status = "poisoned"
@@ -797,7 +666,7 @@ class SoloDownloadTask:
                             break
 
                         if resp.status_code != 200:
-                            resp_text = (await resp.aread()).decode(errors="replace")
+                            resp_text = (await read_bounded(resp)).decode(errors="replace")
                             raise PoisonedChunkError(f"Helper {peer_id} returned HTTP {resp.status_code}: {resp_text[:120]}")
 
                         expected_sha = resp.headers.get("X-Chunk-SHA256", "").strip().lower()
@@ -806,6 +675,8 @@ class SoloDownloadTask:
                                 f"Helper {peer_id} returned invalid or missing X-Chunk-SHA256: '{expected_sha}'"
                             )
 
+                        if not verify_content(expected_sha, resp.headers.get("X-LANPool-Content-Signature", "")):
+                            raise PoisonedChunkError("Unauthenticated helper content digest")
                         body = bytearray()
                         async for b in resp.aiter_bytes(chunk_size=65536):
                             body.extend(b)
@@ -826,6 +697,7 @@ class SoloDownloadTask:
                                 f"Helper {peer_id} returned corrupted chunk: expected SHA {expected_sha}, computed {computed_sha}"
                             )
 
+                        self.helper_origin_bytes += len(body_bytes)
                         consecutive_errors = 0
                         chunk.status = "downloaded"
                         await self.writer_queue.put((chunk.chunk_id, chunk.start_byte, body_bytes))

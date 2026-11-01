@@ -8,12 +8,13 @@ Implements helper fetch primitives for Stage 4 Cooperative Multi-Peer Pooling:
 
 import hashlib
 import logging
+import re
 from typing import Optional, Tuple
 
 import httpx
 
 from config import ALLOW_LOOPBACK_DOWNLOADS, REQUEST_TIMEOUT_SECONDS
-from core.url_safety import validate_download_url
+from core.url_safety import validate_download_url, origin_client
 
 logger = logging.getLogger("lanpool.worker")
 
@@ -46,12 +47,33 @@ def format_if_range(etag: str) -> Optional[str]:
     return val
 
 
+def validate_range_response(resp, start, end, total_size=None, etag=""):
+    if resp.status_code == 200 and format_if_range(etag):
+        raise RemoteContentChangedError("Origin no longer honors the pinned ETag")
+    if resp.status_code != 206:
+        raise PoisonedChunkError(f"Expected HTTP 206, got {resp.status_code}")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", resp.headers.get("Content-Range", ""))
+    if not match:
+        raise PoisonedChunkError("Missing or invalid Content-Range")
+    actual_start, actual_end, total = map(int, match.groups())
+    if (actual_start, actual_end) != (start, end) or total <= end or (total_size is not None and total != total_size):
+        raise PoisonedChunkError("Content-Range does not match requested offset/total")
+    if resp.headers.get("Content-Encoding", "identity").lower() != "identity":
+        raise PoisonedChunkError("Encoded byte ranges are not supported")
+    if etag and format_if_range(etag) and resp.headers.get("ETag", "").strip() != format_if_range(etag):
+        raise RemoteContentChangedError("Origin ETag changed or disappeared")
+    return total
+
+
 async def fetch_chunk_from_origin(
     url: str,
     start_byte: int,
     end_byte: int,
     etag: str = "",
     client: Optional[httpx.AsyncClient] = None,
+    total_size: Optional[int] = None,
+    throttle=None,
+    on_bytes=None,
 ) -> Tuple[bytes, str]:
     """
     Fetches a single chunk from the origin server via HTTP Range:
@@ -69,6 +91,7 @@ async def fetch_chunk_from_origin(
     await validate_download_url(url, allow_loopback=ALLOW_LOOPBACK_DOWNLOADS)
 
     headers = {
+        "User-Agent": "LANPool/1.1",
         "Range": f"bytes={start_byte}-{end_byte}",
         "Accept-Encoding": "identity",
     }
@@ -80,6 +103,7 @@ async def fetch_chunk_from_origin(
 
     async def _execute_fetch(http_client: httpx.AsyncClient) -> Tuple[bytes, str]:
         async with http_client.stream("GET", url, headers=headers, follow_redirects=False) as resp:
+            validate_range_response(resp, start_byte, end_byte, total_size, etag)
             # Check redirects (Poison / SSRF circumvention attempt)
             if 300 <= resp.status_code < 400:
                 raise PoisonedChunkError(
@@ -113,6 +137,10 @@ async def fetch_chunk_from_origin(
             # Read chunk body with strict bounds check (Finding E)
             body = bytearray()
             async for chunk_bytes in resp.aiter_bytes(chunk_size=65536):
+                if throttle:
+                    await throttle(len(chunk_bytes))
+                if on_bytes:
+                    on_bytes(len(chunk_bytes))
                 body.extend(chunk_bytes)
                 if len(body) > expected_len:
                     raise PoisonedChunkError(
@@ -131,5 +159,5 @@ async def fetch_chunk_from_origin(
     if client is not None:
         return await _execute_fetch(client)
     else:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as default_client:
+        async with origin_client() as default_client:
             return await _execute_fetch(default_client)

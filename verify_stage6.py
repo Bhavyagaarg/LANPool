@@ -28,8 +28,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import os
+os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
 
@@ -59,6 +64,11 @@ def run_stage6_verification_gate() -> bool:
 
     # Isolated runtime directory for this gate run
     tmp_runtime = Path(tempfile.mkdtemp(prefix="lanpool_s6_runtime_"))
+    retained_runtime = PROJECT_ROOT / "demo_runtime"
+    retained_existed = retained_runtime.exists()
+    retained_runtime.mkdir(exist_ok=True)
+    retained_marker = retained_runtime / (".preserve-check-" + uuid.uuid4().hex)
+    retained_marker.write_text("existing interactive demo data", encoding="utf-8")
 
     # Import cluster manager from demo_cluster
     from demo_cluster import DEMO_FILE_SPECS, ORIGIN_SHAS, DemoClusterManager
@@ -218,6 +228,7 @@ def run_stage6_verification_gate() -> bool:
         )
         assert cli_test.returncode == 0, f"demo_cluster.py --headless-check failed: {cli_test.stdout}"
         assert "DEMO_CLUSTER_VERIFIED_OK" in cli_test.stdout
+        assert retained_marker.read_text(encoding="utf-8") == "existing interactive demo data", "Headless check modified interactive demo storage"
 
         dt4 = time.time() - t0
         print(f"[Check 4: Clean cluster teardown & zero process leaks] -> PASSED ({dt4:.2f}s)")
@@ -225,6 +236,12 @@ def run_stage6_verification_gate() -> bool:
     finally:
         cluster.stop_cluster(cleanup_runtime=True)
         shutil.rmtree(tmp_runtime, ignore_errors=True)
+        retained_marker.unlink(missing_ok=True)
+        if not retained_existed:
+            try:
+                retained_runtime.rmdir()  # Empty only; never recursively remove existing demo data.
+            except OSError:
+                pass
 
     total_time = time.time() - total_start
     print("-" * 70)

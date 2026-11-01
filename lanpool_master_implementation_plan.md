@@ -1,3 +1,5 @@
+> Historical implementation plan. README.md, SECURITY.md, FIXES.md, and KNOWN_ISSUES.md define the current supported behavior and supersede earlier claims below.
+
 # LANPool: Cooperative Bandwidth Aggregation & LAN-Cache System
 **Master Technical Specification & Staged Implementation Plan (SSOT for OpenCode & Antigravity)**
 
