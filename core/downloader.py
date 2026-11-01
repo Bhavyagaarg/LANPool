@@ -38,7 +38,7 @@ from core.net_utils import verify_disk_space_or_raise
 from core.peer_registry import PeerRegistry
 from core.url_safety import validate_download_url, origin_client
 from core.peer_auth import signed_request, verify_content, send_bounded, read_bounded, peer_client, peer_url
-from config import PEER_SECRET, BOOST_THRESHOLD_MB
+from config import PEER_SECRET, BOOST_THRESHOLD_MB, TRUST_GROUP_CONTENT
 from core.cache_manager import strong_etag
 from core.io_utils import disk_call, acquire_resource
 from core.worker import PoisonedChunkError, RemoteContentChangedError, format_if_range
@@ -337,6 +337,8 @@ class SoloDownloadTask:
         return await acquire_resource(lambda: open(path, mode), lambda handle: handle.close())
 
     def _eligible_peers(self):
+        if not self.expected_sha256 and not TRUST_GROUP_CONTENT:
+            return []  # A group member can authenticate its own forged digest.
         if not self.use_peers or not PEER_SECRET or not self.peer_registry:
             return []
         peers = [p for p in self.peer_registry.list_peers() if p.get("trusted") and p.get("available", True) and p.get("node_id") != self.own_node_id]
@@ -552,6 +554,8 @@ class SoloDownloadTask:
                 self.chunk_queue.task_done()
 
     async def _query_peer_caches(self, peers):
+        if not self.expected_sha256 and not TRUST_GROUP_CONTENT:
+            return []
         async def query(peer):
             if not PEER_SECRET or not peer.get("trusted") or not peer.get("available", True):
                 return None

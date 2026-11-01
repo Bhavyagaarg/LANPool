@@ -38,6 +38,8 @@ from typing import Dict, Optional
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
@@ -439,6 +441,7 @@ def run_stage5_verification_gate() -> bool:
         ("Check 3: Good Samaritan Boost notification & response", check3_boost_flow),
         ("Check 4: UDP Beacon QoS propagation between nodes", check4_udp_beacon_qos_propagation),
         ("Check 5: Web UI static serving & download telemetry", check5_web_ui_and_telemetry),
+        ("Check 6: Measured helper throughput at 10% and Game Mode 15%", check6_measured_throughput),
     ]
 
     gate_start = time.time()
@@ -458,6 +461,37 @@ def run_stage5_verification_gate() -> bool:
     print(f"Stage 5 Gate Status: PASSED (Total Runtime: {total_time:.2f}s)")
     print("======================================================================")
     return True
+
+
+def check6_measured_throughput():
+    """Measure real HTTP bodies, not just effective-share labels."""
+    with tempfile.TemporaryDirectory(prefix="lanpool_s5_rate_") as folder:
+        root = Path(folder)
+        port = get_free_port()
+        proc = start_node(port, root / "cache", root / "downloads", env_extra={"LANPOOL_MAX_HELPER_KBPS": "20480", "LANPOOL_API_TOKEN": ""})
+        try:
+            wait_for_health(port)
+            base = f"http://127.0.0.1:{port}"
+            with httpx.Client(timeout=60, trust_env=False) as client:
+                origin = base + "/api/test-file/10"
+                head = client.head(origin)
+                head.raise_for_status()
+                length = int(head.headers["Content-Length"])
+                for settings, label in (({"share_pct": 10, "boosted": False, "simulate_game_mode": False}, "10% share"), ({"share_pct": 100, "boosted": False, "simulate_game_mode": True}, "Game Mode 15%")):
+                    response = client.post(base + "/api/qos/update", json={**settings, "throttling_enabled": True})
+                    response.raise_for_status()
+                    qos = response.json()
+                    minimum = length / qos["effective_rate_limit_bps"]
+                    started = time.monotonic()
+                    chunk = client.post(base + "/api/worker/fetch-chunk", json={"url": origin, "start_byte": 0, "end_byte": length - 1, "chunk_id": 0, "etag": head.headers["ETag"], "total_size": length})
+                    elapsed = time.monotonic() - started
+                    chunk.raise_for_status()
+                    assert len(chunk.content) == length
+                    assert hashlib.sha256(chunk.content).hexdigest() == chunk.headers["X-Chunk-SHA256"]
+                    assert elapsed >= minimum * 0.95, f"{label} exceeded rate ceiling: {elapsed:.3f}s < {minimum:.3f}s"
+                    print(f"  {label}: {elapsed:.3f}s for 10 MiB; minimum {minimum:.3f}s")
+        finally:
+            terminate_proc(proc)
 
 
 if __name__ == "__main__":

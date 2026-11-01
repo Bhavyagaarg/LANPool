@@ -6,7 +6,9 @@ Python 3.12+; validated locally on Windows with Python 3.12 and 3.14.
 LANPool downloads files submitted through its API/dashboard. It does not intercept
 Steam, other launchers, or arbitrary laptop traffic. It runs in a terminal rather
 than installing a Windows service. See [FIXES.md](FIXES.md) for the audit remediation
-and [SECURITY.md](SECURITY.md) before exposing a node to a network.
+and [SECURITY.md](SECURITY.md) before exposing a node to a network. The separate
+25-item Ponytail review is resolved in [PONYTAIL_STATUS.md](PONYTAIL_STATUS.md).
+Existing rights remain reserved; see [LICENSE](LICENSE).
 
 ## Install and run
 
@@ -51,9 +53,12 @@ Network bodies are bounded while streaming. A single writer owns the output;
 disk operations/hashing run off the event loop and finish before cancellation
 closes their resources. The final SHA-256 is computed before publishing.
 
-Supply a publisher-trusted expected hash for authenticity beyond trusting the
-origin and enrolled peers. Multi-chunk downloads without a strong ETag require
-this expected hash. Weak/missing ETags never authorize URL cache reuse. Existing
+A trusted publisher SHA-256 is required to use peer content by default. Without
+it, a job downloads directly using its own origin workers. Group authentication
+alone does not prove a helper's honesty. `LANPOOL_TRUST_GROUP_CONTENT=1` explicitly
+allows content without an independent hash from an enrolled group; the controlled
+single-PC demo/tests enable it. Do not enable it for an untrusted group.
+Multi-chunk downloads without a strong ETag also require this expected hash. Weak/missing ETags never authorize URL cache reuse. Existing
 legacy cache validators are invalidated once; content remains accessible by hash.
 
 Example request:
@@ -62,10 +67,14 @@ Example request:
 {"url":"https://example.org/file.iso","filename":"file.iso","expected_sha256":"<64 hex characters from a trusted publisher>"}
 ```
 
-Completed files normally move into the cache and can be downloaded through its
-dashboard list. Files larger than the cache quota remain in the downloads folder.
+Completed files consistently remain in the node's `downloads/` folder, regardless
+of solo, pooled, or cache-hit source. An independent atomic copy is stored in the
+cache when quota/free space permit; downloads remain intact if caching is skipped.
+The cache copy is also downloadable through the dashboard. This uses additional
+disk space; the 10 GiB limit applies to the cache, not the retained user outputs.
 Cache copies/streams verify hashes, read leases prevent eviction/renaming during
-use, URL aliases survive content deduplication, and LRU reads persist access times.
+use, URL aliases survive content deduplication, and LRU reads persist access times in debounced batches (at most two seconds
+between background flushes, plus a final flush on clean shutdown).
 Quota is enforced on rebuild and registration; an active lease can cause new
 caching to be skipped until capacity is available.
 
@@ -145,7 +154,13 @@ putting the administrative token in a URL.
 ```
 
 The first runs adversarial security/integrity/QoS/cancellation/API tests; the second
-runs all seven legacy stage gates and writes the ignored `PROJECT_STATE.md`.
+runs all seven stage gates in fresh temporary cache/download directories and
+writes the ignored `PROJECT_STATE.md`. Stage 5 measures real 10%/Game Mode helper
+throughput; Stage 6 observes automatic boost acceptance and completion release.
+Stage 1/2 require the suite's isolated fixture server and refuse unsafe direct CLI
+use. Config imports do not create storage directories. The test-file HTTP endpoint
+is disabled by default; demo/gates explicitly enable `LANPOOL_TEST_FILES=1`. Enabled
+fixtures stream 64 KiB blocks with bounded concurrency, and HEAD allocates no file.
 Stop other LANPool demos first: discovery tests assume their own isolated cluster.
 CI runs both suites on Windows/Linux with Python 3.12 and 3.14.
 

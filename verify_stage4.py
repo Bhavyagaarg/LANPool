@@ -47,6 +47,8 @@ from typing import Dict, List, Optional, Tuple
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx

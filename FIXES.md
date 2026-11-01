@@ -1,6 +1,8 @@
 # Remediation of the 1 November 2026 review
 
 This branch addresses the 30 numbered findings in the initial local review.
+The separate 25-item Ponytail review and its follow-up fixes are documented in
+[PONYTAIL_STATUS.md](PONYTAIL_STATUS.md); use that file for Ponytail item numbers.
 Architectural limits are stated explicitly rather than represented as performance
 or security guarantees. The historical local report is not a current bug list.
 
@@ -28,7 +30,7 @@ or security guarantees. The historical local report is not a current bug list.
 | 20 | Disk/hash/cache operations off event loop; threaded I/O awaited before close | Downloader I/O helpers and cancellation tests |
 | 21 | Persistent URL/validator alias sets per content hash | Deduplication/restart regression |
 | 22 | Startup quota enforcement; failed deletion/leased entries retain accounting | Small-quota and active-lease tests |
-| 23 | Read access persisted; flush on shutdown | Restart preserves latest access time |
+| 23 | Read access debounced, periodic flush and final clean-shutdown flush | Restart preserves latest flushed access time; abrupt crashes may lose the newest batch |
 | 24 | Verified read leases prevent rename/eviction | Active reader tests; cache registration skips pinned quota |
 | 25 | Strict share/type/finite timestamp checks, HMAC beacons | Malformed/unsigned datagram tests |
 | 26 | Manual health/QoS leases refresh without UDP; offline entries excluded from work | Registry refresh path; preserved manual address |

@@ -310,6 +310,8 @@ class DemoClusterManager:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["LANPOOL_ALLOW_LOOPBACK"] = "1"
+        env["LANPOOL_TEST_FILES"] = "1"
+        env["LANPOOL_TRUST_GROUP_CONTENT"] = "1"  # Controlled single-PC fixture group.
         env["LANPOOL_PEER_SECRET"] = self.peer_secret
 
         self.log_paths[port] = node_dir / "node.log"
@@ -536,6 +538,8 @@ class DemoClusterManager:
 
         if cleanup_runtime and self.runtime_dir.exists():
             shutil.rmtree(self.runtime_dir, ignore_errors=True)
+        elif self.runtime_dir.exists():
+            logger.info("Interactive demo data retained at %s (use --cleanup to remove on exit)", self.runtime_dir.resolve())
 
         logger.info("Cluster stopped cleanly. Zero process leaks.")
 

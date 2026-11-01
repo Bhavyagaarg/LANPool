@@ -53,7 +53,7 @@ class NodeQoSManager:
         self.throttling_enabled: bool = throttling_enabled
 
         self.game_process_names: set = {
-            name.lower().strip() for name in (game_process_names or GAME_PROCESS_NAMES)
+            name.lower().strip().removesuffix(".exe") for name in (game_process_names or GAME_PROCESS_NAMES)
         }
         self.active_boost_request: Optional[Dict[str, Any]] = None
 
@@ -100,7 +100,7 @@ class NodeQoSManager:
         try:
             for proc in psutil.process_iter(["name"]):
                 try:
-                    pname = (proc.info.get("name") or "").lower().strip()
+                    pname = (proc.info.get("name") or "").lower().strip().removesuffix(".exe")
                     if pname in self.game_process_names:
                         found = True
                         break

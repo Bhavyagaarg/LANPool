@@ -33,6 +33,8 @@ from typing import Dict, Optional, Tuple
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
@@ -688,7 +690,9 @@ def check7_peer_registry_capacity_preservation_and_dedupe() -> None:
     peers_m = [p for p in reg_man.list_peers() if p["ip"] == "10.0.0.5" and p["port"] == 8000]
     assert len(peers_m) == 1, f"Expected 1 peer, got {len(peers_m)}"
     assert peers_m[0].get("manual") is True, "Manual flag must be preserved"
-    assert peers_m[0]["node_id"] == "restarted-node", "node_id should update to restarted node"
+    assert peers_m[0]["node_id"] == "manual-node", "UDP must not replace a manually enrolled identity"
+    reg_man.refresh_health("manual-node", {"node_id": "restarted-node", "qos": {"effective_share_pct": 30}}, trusted=True)
+    assert reg_man.get("restarted-node")["manual"] is True, "Authenticated health proof should refresh a restarted identity"
 
     # Part D: Manual add upgrades UDP peer
     reg_up = PeerRegistry(own_node_id="own", own_http_port=8000, own_lan_ip="192.168.1.100")

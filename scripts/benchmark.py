@@ -41,6 +41,8 @@ def main():
                     raise TimeoutError(job_id)
                 if status["status"] != "completed":
                     raise RuntimeError(status.get("error"))
+                if mode == "pooled" and status.get("helper_origin_bytes", 0) == 0:
+                    raise RuntimeError("No helper contributed: provide a trusted publisher SHA-256, pair healthy peers, and use a multi-chunk file; refusing to label a solo result as pooled")
                 elapsed = time.monotonic() - started
                 samples[mode].append({"seconds": round(elapsed, 3), "mibps": round(status["total_size"] / elapsed / 1048576, 3), "source": status["source"], "sha256": status["sha256"], "requester_origin_bytes": status["origin_received_bytes"], "helper_origin_bytes": status["helper_origin_bytes"]})
     summary = {mode: round(statistics.median(sample["seconds"] for sample in runs), 3) for mode, runs in samples.items()}

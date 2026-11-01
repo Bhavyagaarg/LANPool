@@ -2,8 +2,11 @@
 
 LANPool is for an enrolled, trusted group on a private LAN/VPN. It is not an
 Internet-facing untrusted file-sharing service. A machine owner and any holder of
-the peer group key are trusted. Compromised group members can deny service; use a
-publisher-trusted expected SHA-256 to reject substituted content.
+the peer group key can affect peer availability. Compromised group members can
+deny service, but production peer content requires a publisher-trusted expected
+SHA-256 by default, and substituted bytes are rejected before publication. If
+`LANPOOL_TRUST_GROUP_CONTENT=1` is explicitly enabled, members are trusted for file
+content too; their authenticated self-attested hashes do not prove honesty.
 
 - Default HTTP binding is localhost. Binding elsewhere requires an admin token,
   a peer group secret, and a TLS certificate/key. Explicit
@@ -36,6 +39,9 @@ publisher-trusted expected SHA-256 to reject substituted content.
   unauthenticated local administration also checks the Host to reject rebinding.
 - Browser grants expire after 30 seconds, authorize one hash, and are single use.
   Keep access logs private: they can contain a short-lived already-consumed grant.
+- The optional test-file API is disabled by default. Enabling
+  `LANPOOL_TEST_FILES=1` opts into bounded synthetic fixture streams for testing;
+  it is not needed for ordinary production downloads.
 - Local unauthenticated administration is restricted to loopback callers and
   same-origin browser requests. Set an admin token if other local users/processes
   are outside your trust boundary. Do not open untrusted sites while running an

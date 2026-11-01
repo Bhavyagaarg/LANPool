@@ -20,7 +20,7 @@ from core.peer_auth import beacon_signature, trusted_beacon, verify_content, sen
 from config import PEER_SECRET
 
 from config import BEACON_INTERVAL_SECONDS, PEER_TTL_SECONDS, UDP_DISCOVERY_PORT
-from core.peer_registry import PeerRegistry
+from core.peer_registry import PeerRegistry, NODE_ID_PATTERN
 
 logger = logging.getLogger("lanpool.discovery")
 
@@ -205,7 +205,7 @@ class PeerDiscovery:
         boosted = packet.get("boosted", False)
         if type(share_pct) is not int or not 0 <= share_pct <= 100 or type(game_mode) is not bool or type(boosted) is not bool:
             return
-        if len(peer_node_id) > 64:
+        if not NODE_ID_PATTERN.fullmatch(peer_node_id):
             return
         trusted = trusted_beacon(packet)
         scheme = packet.get("scheme", "http")

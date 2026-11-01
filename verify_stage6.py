@@ -34,6 +34,8 @@ from typing import Dict, List, Optional
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
@@ -55,12 +57,8 @@ def run_stage6_verification_gate() -> bool:
     print("=" * 70)
 
     total_start = time.time()
-    base_port = get_free_port()
-    # Ensure next 2 ports are also potentially free or pick clean range
-    node1_port = base_port
-    node2_port = get_free_port()
-    node3_port = get_free_port()
-    origin_port = get_free_port()
+    from scripts.test_support import allocate_ports
+    node1_port, node2_port, node3_port, origin_port = allocate_ports(4)
 
     # Isolated runtime directory for this gate run
     tmp_runtime = Path(tempfile.mkdtemp(prefix="lanpool_s6_runtime_"))
@@ -134,6 +132,9 @@ def run_stage6_verification_gate() -> bool:
         deadline = time.time() + 45.0
         final_status = None
         seen_workers = set()
+        seen_auto_boost = False
+        accepted_auto_boost = False
+        baseline_share = q2["share_pct"]
 
         while time.time() < deadline:
             st = httpx.get(
@@ -141,6 +142,14 @@ def run_stage6_verification_gate() -> bool:
                 params={"job_id": job_id},
                 timeout=3.0,
             ).json()
+            if not accepted_auto_boost:
+                helper_qos = httpx.get(f"http://127.0.0.1:{node2_port}/api/qos/status", timeout=3).json()
+                active = helper_qos.get("active_boost_request")
+                if active and active.get("job_id") == job_id:
+                    seen_auto_boost = True
+                    accepted = httpx.post(f"http://127.0.0.1:{node2_port}/api/qos/boost-respond", json={"action": "boost"}, timeout=3)
+                    assert accepted.status_code == 200
+                    accepted_auto_boost = True
 
             for ch in st.get("chunks", []):
                 w = ch.get("worker_id")
@@ -176,6 +185,11 @@ def run_stage6_verification_gate() -> bool:
         )
         assert stream_resp.status_code == 200, f"Cache stream failed: {stream_resp.status_code}"
         assert len(stream_resp.content) == DEMO_FILE_SPECS[test_file]
+        assert seen_auto_boost and accepted_auto_boost, "Pooled job did not automatically create a boost prompt"
+        released = httpx.get(f"http://127.0.0.1:{node2_port}/api/qos/status", timeout=3).json()
+        assert released["boosted"] is False, "Accepted job boost was not released at completion"
+        assert released["share_pct"] == baseline_share, "Job boost overwrote the helper's baseline"
+        print("  Automatic boost observed through HTTP, accepted, and released with baseline preserved")
 
         dt2 = time.time() - t0
         print(f"[Check 2: End-to-end pooled download with WAN+LAN telemetry] -> PASSED ({dt2:.2f}s)")

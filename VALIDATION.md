@@ -5,15 +5,17 @@ in `requirements.lock`. The branch's review resolutions are listed in `FIXES.md`
 
 | Verification | Result |
 |---|---|
-| Adversarial regression suite, Python 3.14 | 28 passed |
-| Adversarial regression suite, Python 3.12 | 28 passed |
+| Adversarial regression suite, Python 3.14 | 43 passed |
+| Adversarial regression suite, Python 3.12 | 43 passed |
 | Installed dependency consistency | `pip check` passed |
 | Legacy stage gates 1, 2, 3, 3.5, 4, 5, 6 | All seven passed |
 | Nested CLI demo startup and teardown | Passed |
 | Headless checks preserve existing interactive demo storage | Passed |
 | Live 60 MiB pooled transfer and SHA-256 verification | Passed; 40 MiB requester + 20 MiB helpers |
 | Repeat local-cache copy | Passed |
-| Real HTTP 10 MiB helper at configured 10% share | 13.065 s; above the 5 s minimum ceiling check |
+| Real HTTP 10 MiB helper at configured 10% share | 11.729 s; above the 5 s minimum ceiling check |
+| Real HTTP 10 MiB helper in Game Mode 15% | 8.883 s; above the 3.333 s minimum ceiling check |
+| Automatic boost accepted and released through HTTP | Passed in Stage 6, with baseline preserved |
 | Real TLS connection and manual group enrollment | Passed with trusted certificate; rejected without trust |
 | Browser review in Microsoft Edge | Cache entries, paired peers, job controls and MiB/s telemetry rendered |
 
@@ -32,8 +34,13 @@ is a ceiling rather than a throughput guarantee. A single-PC equal-concurrency
 benchmark also showed pooling can be slower under sharing limits; the benchmark
 does not establish additional physical WAN capacity.
 
+The Ponytail follow-up and per-item evidence are in `PONYTAIL_STATUS.md`.
+The suite uses fresh owned temporary storage and tests that config import is pure,
+that environment settings are restored, and that retained outputs are independent
+of their cache copies.
+
 Local evidence is intentionally ignored by Git: `PROJECT_STATE.md`,
-`verification-fixes.log`, `verification-stage6-final.log`,
+`verification-fixes.log`, `verification-ponytail.log`, `verification-stage6-final.log`,
 `regression-results-py312.log`, `regression-results-py314.log`,
 `LOCAL_SMOKE_RESULTS.json`, and `benchmark-results.json`.
 

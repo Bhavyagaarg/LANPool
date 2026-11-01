@@ -44,6 +44,8 @@ from pathlib import Path
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
@@ -114,7 +116,8 @@ async def run_stage2_verification(server_url: str = "http://127.0.0.1:8000"):
         cached_file_path = local_matches[0]
         assert cached_file_path.exists(), f"Cached file not found on disk: {cached_file_path}"
         download_copy_path = DOWNLOAD_DIR / test_filename
-        assert not download_copy_path.exists(), f"File was not moved! Still exists in downloads/: {download_copy_path}"
+        assert download_copy_path.exists(), f"Completed user download is missing: {download_copy_path}"
+        assert hashlib.sha256(download_copy_path.read_bytes()).hexdigest() == downloaded_sha256
         print(f"  ✓ Physical file verified in LANPool_Cache/: {cached_file_path.name}")
         print(f"  ✓ Verified file moved: {download_copy_path.name} is no longer in downloads/")
 
@@ -568,5 +571,7 @@ async def run_stage2_verification(server_url: str = "http://127.0.0.1:8000"):
 
 
 if __name__ == "__main__":
+    if os.environ.get("LANPOOL_VERIFICATION") != "1":
+        sys.exit("Run scripts/export_state.py: Stage 1/2 require an isolated fixture server/storage.")
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     asyncio.run(run_stage2_verification(f"http://127.0.0.1:{port}"))

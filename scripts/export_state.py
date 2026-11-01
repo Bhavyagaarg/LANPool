@@ -13,14 +13,13 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
+import secrets
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import List, Tuple
 
-os.environ["LANPOOL_ALLOW_LOOPBACK"] = "1"
-os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
-os.environ["PYTHONUTF8"] = "1"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BOARD_FILE = PROJECT_ROOT / ".agents" / "board.md"
 AUDIT_FILE = PROJECT_ROOT / ".agents" / "code_audit.md"
@@ -133,7 +132,7 @@ def run_verification_gates(port: int) -> Tuple[bool, str, bool, str]:
     Boots main.py on ephemeral port, runs verify_stage1.py and verify_stage2.py,
     and terminates the server in a finally block.
     """
-    server_cmd = [sys.executable, "main.py", "--port", str(port)]
+    server_cmd = [sys.executable, "main.py", "--port", str(port), "--cache-dir", os.environ["LANPOOL_CACHE_DIR"], "--download-dir", os.environ["LANPOOL_DOWNLOAD_DIR"]]
     server_proc = subprocess.Popen(
         server_cmd,
         cwd=str(PROJECT_ROOT),
@@ -182,10 +181,6 @@ def run_verification_gates(port: int) -> Tuple[bool, str, bool, str]:
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_proc.wait()
-        for f in (PROJECT_ROOT / "downloads").glob("*.bin"):
-            f.unlink(missing_ok=True)
-        for f in (PROJECT_ROOT / "downloads").glob("*.part"):
-            f.unlink(missing_ok=True)
 
     return stage1_ok, stage1_output, stage2_ok, stage2_output
 
@@ -273,7 +268,7 @@ def collect_python_sources(root: Path) -> str:
     return "\n".join(sections)
 
 
-def export_project_state() -> int:
+def _export_project_state() -> int:
     """Runs verification gates and exports complete project state to PROJECT_STATE.md."""
     print("Exporting project state to PROJECT_STATE.md...")
     port = get_free_port()
@@ -388,6 +383,26 @@ Overall Verification Status: **{overall_status}**
     print(f"Successfully generated {OUTPUT_FILE} ({len(md_content):,} bytes).")
 
     return 0 if (s1_ok and s2_ok and s3_ok and s35_ok and s4_ok and s5_ok and s6_ok) else 1
+
+
+def export_project_state() -> int:
+    """All gate processes share only a fresh owned fixture root, never user storage."""
+    fixture_env = {"LANPOOL_ALLOW_LOOPBACK": "1", "LANPOOL_TEST_FILES": "1", "LANPOOL_TRUST_GROUP_CONTENT": "1", "LANPOOL_API_TOKEN": "", "LANPOOL_PEER_SECRET": secrets.token_hex(32), "PYTHONUTF8": "1", "LANPOOL_MAX_HELPER_KBPS": "20480"}
+    variables = ("LANPOOL_CACHE_DIR", "LANPOOL_DOWNLOAD_DIR", "LANPOOL_VERIFICATION", *fixture_env)
+    previous = {key: os.environ.get(key) for key in variables}
+    with tempfile.TemporaryDirectory(prefix="lanpool_verification_") as folder:
+        fixture_root = Path(folder)
+        for directory in (fixture_root / "cache", fixture_root / "downloads"):
+            directory.mkdir()
+        os.environ.update(fixture_env, LANPOOL_CACHE_DIR=str(fixture_root / "cache"), LANPOOL_DOWNLOAD_DIR=str(fixture_root / "downloads"), LANPOOL_VERIFICATION="1")
+        try:
+            return _export_project_state()
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

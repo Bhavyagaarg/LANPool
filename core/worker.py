@@ -15,6 +15,7 @@ import httpx
 
 from config import ALLOW_LOOPBACK_DOWNLOADS, REQUEST_TIMEOUT_SECONDS
 from core.url_safety import validate_download_url, origin_client
+from core.cache_manager import normalize_etag
 
 logger = logging.getLogger("lanpool.worker")
 
@@ -127,8 +128,8 @@ async def fetch_chunk_from_origin(
             if etag:
                 resp_etag = resp.headers.get("ETag")
                 if resp_etag:
-                    clean_resp_etag = resp_etag.strip('"')
-                    clean_expected_etag = etag.strip('"')
+                    clean_resp_etag = normalize_etag(resp_etag)
+                    clean_expected_etag = normalize_etag(etag)
                     if clean_resp_etag != clean_expected_etag:
                         raise RemoteContentChangedError(
                             f"Remote ETag changed: expected '{etag}', received '{resp_etag}'"

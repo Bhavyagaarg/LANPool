@@ -48,7 +48,8 @@ from core.net_utils import get_lan_ip
 from core.peer_discovery import PeerDiscovery
 from core.peer_registry import PeerRegistry
 from core.worker import RemoteContentChangedError, fetch_chunk_from_origin
-from core.test_data import get_deterministic_data
+from core.test_data import iter_test_data
+from config import APP_VERSION, PROJECT_STAGE, TEST_FILES_ENABLED, TRUST_GROUP_CONTENT
 from core.url_safety import validate_download_url
 from core.watchdog import NodeQoSManager
 
@@ -110,6 +111,8 @@ async def lifespan(app: FastAPI):
     lan_ip = getattr(app.state, "lan_ip", None) or get_lan_ip()
     cache_dir = getattr(app.state, "cache_dir", CACHE_DIR)
     download_dir = getattr(app.state, "download_dir", DOWNLOAD_DIR)
+    if Path(cache_dir).resolve() == Path(download_dir).resolve():
+        raise ValueError("Cache and downloads directories must be distinct")
 
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     Path(download_dir).mkdir(parents=True, exist_ok=True)
@@ -123,6 +126,7 @@ async def lifespan(app: FastAPI):
     # Initialize per-node CacheManager (Finding 7)
     app.state.cache_manager = await asyncio.to_thread(CacheManager, cache_dir=cache_dir)
     app.state.helper_slots = asyncio.Semaphore(MAX_HELPER_REQUESTS)
+    app.state.fixture_slots = asyncio.Semaphore(4)
     await load_history(app)
 
     # Initialize per-node QoS Manager (Safeguard #11 & Stage 5)
@@ -147,6 +151,11 @@ async def lifespan(app: FastAPI):
     app.state.peer_registry = registry
     app.state.peer_discovery = discovery
 
+    async def flush_cache_periodically():
+        while True:
+            await asyncio.sleep(2)
+            await disk_call(app.state.cache_manager.flush)
+    cache_flush_task = asyncio.create_task(flush_cache_periodically(), name="lanpool-cache-flush")
     await discovery.start()
     try:
         yield
@@ -155,10 +164,12 @@ async def lifespan(app: FastAPI):
         await save_history()
         await discovery.stop()
         await app.state.qos_manager.aclose()
-        await asyncio.to_thread(app.state.cache_manager.flush)
+        cache_flush_task.cancel()
+        await asyncio.gather(cache_flush_task, return_exceptions=True)
+        await disk_call(app.state.cache_manager.flush)
 
 
-app = FastAPI(title="LANPool Node", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LANPool Node", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(BodyLimitMiddleware)
 
 # Active download tasks registry
@@ -271,8 +282,9 @@ async def health(request: Request):
         "qos": {key: request.app.state.qos_manager.get_status()[key] for key in ("effective_share_pct", "effective_game_mode", "boosted")},
         "status": "online",
         "lan_ip": lan_ip,
-        "stage": 5,
-        "version": "1.0.0",
+        "stage": PROJECT_STAGE,
+        "peer_hash_required": not TRUST_GROUP_CONTENT,
+        "version": APP_VERSION,
         "active_downloads": len([t for t in download_tasks.values() if t.status in ("probing", "downloading", "queued")]),
         "node_id": node_id,
         "http_port": http_port,
@@ -614,64 +626,47 @@ async def retry_job(job_id: str, request: Request):
 
 @app.get("/api/test-file/{size_mb}")
 @app.head("/api/test-file/{size_mb}")
-async def serve_test_file(
-    size_mb: int,
-    request: Request,
-    range: Optional[str] = Header(None)
-):
-    """
-    Deterministic binary stream endpoint supporting HTTP HEAD and Range: bytes=X-Y (HTTP 206).
-    Capped at 100 MB (Finding 8).
-    """
-    if size_mb <= 0 or size_mb > 100:
-        raise HTTPException(status_code=400, detail="size_mb must be between 1 and 100 MB")
-
-    data = get_deterministic_data(size_mb)
-    total_size = len(data)
-    etag = f'"test-file-{size_mb}mb-{hashlib.sha256(data[:1024]).hexdigest()[:12]}"'
-
-    common_headers = {
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-    }
-
+async def serve_test_file(size_mb: int, request: Request, range: Optional[str] = Header(None)):
+    if not TEST_FILES_ENABLED:
+        raise HTTPException(404, "Test fixtures are disabled")
+    if not 1 <= size_mb <= 100:
+        raise HTTPException(400, "size_mb must be between 1 and 100 MiB")
+    total = size_mb * 1048576
+    headers = {"Accept-Ranges": "bytes", "ETag": f'"test-file-v3-{size_mb}mb"'}
     if request.method == "HEAD":
-        headers = dict(common_headers)
-        headers["Content-Length"] = str(total_size)
-        return Response(status_code=200, headers=headers)
-
-    if range and range.startswith("bytes="):
-        range_spec = range[len("bytes="):].strip()
-        parts = range_spec.split("-")
-
-        try:
-            if not parts[0] and len(parts) > 1 and parts[1]:
-                # Suffix range: bytes=-500 -> last 500 bytes
-                suffix_len = int(parts[1])
-                start = max(total_size - suffix_len, 0)
-                end = total_size - 1
-            else:
-                start = int(parts[0]) if parts[0] else 0
-                end = int(parts[1]) if len(parts) > 1 and parts[1] else total_size - 1
-        except ValueError:
-            raise HTTPException(status_code=416, detail="Invalid Range header format")
-
-        if start < 0 or end >= total_size or start > end:
-            raise HTTPException(
-                status_code=416,
-                detail="Requested range not satisfiable",
-                headers={"Content-Range": f"bytes */{total_size}"}
-            )
-
-        content = data[start:end + 1]
-        range_headers = dict(common_headers)
-        range_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
-        range_headers["Content-Length"] = str(len(content))
-        return Response(content=content, status_code=206, headers=range_headers)
-
-    full_headers = dict(common_headers)
-    full_headers["Content-Length"] = str(total_size)
-    return Response(content=data, status_code=200, headers=full_headers)
+        return Response(headers={**headers, "Content-Length": str(total)})
+    start, end, status = 0, total - 1, 200
+    if range:
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range)
+        if not match or not any(match.groups()):
+            raise HTTPException(416, "Invalid Range", headers={"Content-Range": f"bytes */{total}"})
+        first, last = match.groups()
+        if first:
+            start, end = int(first), min(int(last), total - 1) if last else total - 1
+        else:
+            suffix = int(last)
+            if suffix <= 0:
+                raise HTTPException(416, "Invalid suffix range")
+            start = max(0, total - suffix)
+        if start > end or start >= total:
+            raise HTTPException(416, "Range not satisfiable", headers={"Content-Range": f"bytes */{total}"})
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        status = 206
+    slots = request.app.state.fixture_slots
+    if slots.locked():
+        raise HTTPException(429, "Test fixture stream limit reached")
+    await slots.acquire()
+    released = False
+    async def release():
+        nonlocal released
+        if not released:
+            released = True
+            slots.release()
+    async def stream():
+        for block in iter_test_data(size_mb, start, end):
+            yield block
+    headers["Content-Length"] = str(end - start + 1)
+    return ManagedStreamingResponse(stream(), status_code=status, on_close=release, headers=headers, media_type="application/octet-stream")
 
 
 @app.get("/api/cache/list", dependencies=[Depends(require_api_token)])
@@ -883,7 +878,7 @@ async def serve_dashboard():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
         return FileResponse(index_file, media_type="text/html")
-    return {"status": "online", "message": "LANPool Web Dashboard UI loading...", "stage": 5}
+    return {"status": "online", "message": "LANPool Web Dashboard UI loading...", "stage": PROJECT_STAGE}
 
 
 def main():

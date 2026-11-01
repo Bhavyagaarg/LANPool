@@ -20,6 +20,8 @@ from typing import Dict, List, Set
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
@@ -247,5 +249,7 @@ async def run_verification(server_url: str = "http://127.0.0.1:8000"):
 
 
 if __name__ == "__main__":
+    if os.environ.get("LANPOOL_VERIFICATION") != "1":
+        sys.exit("Run scripts/export_state.py: Stage 1/2 require an isolated fixture server/storage.")
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     asyncio.run(run_verification(f"http://127.0.0.1:{port}"))

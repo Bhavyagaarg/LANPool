@@ -9,9 +9,11 @@ Enforces Finding 9 (MAX_UDP_PEERS = 256 capacity limit) and Finding 10 (IP safet
 import ipaddress
 import threading
 import time
+import re
 from typing import Dict, List, Optional
 
 MAX_UDP_PEERS = 256
+NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class PeerRegistry:
@@ -49,6 +51,8 @@ class PeerRegistry:
         and enforces MAX_UDP_PEERS capacity cap by evicting oldest UDP peer.
         Includes QoS fields: share_pct, game_mode, boosted (Safeguard #11).
         """
+        if not isinstance(node_id, str) or not NODE_ID_PATTERN.fullmatch(node_id):
+            return None
         if self.is_self(ip=ip, port=port, node_id=node_id):
             return None
 
@@ -61,6 +65,9 @@ class PeerRegistry:
                 k for k, p in self._peers.items()
                 if k != node_id and p.get("ip") == ip and p.get("port") == port
             ]
+            # Identity changes to an enrolled endpoint require fresh HTTP proof.
+            if any(self._peers[key].get("manual") for key in colliding_keys):
+                return None
             for col_k in colliding_keys:
                 if self._peers[col_k].get("manual", False):
                     was_manual = True
@@ -127,6 +134,8 @@ class PeerRegistry:
         Updates existing UDP peer in place and sets manual=True.
         """
         raw_ip = (ip or "").strip()
+        if node_id is not None and not NODE_ID_PATTERN.fullmatch(node_id):
+            raise ValueError("Invalid peer node_id")
         try:
             ip_obj = ipaddress.IPv4Address(raw_ip)
             if ip_obj.is_unspecified or ip_obj.is_multicast or ip_obj.is_link_local or str(ip_obj) == "255.255.255.255":

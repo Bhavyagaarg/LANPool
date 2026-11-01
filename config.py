@@ -6,9 +6,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = Path(os.environ.get("LANPOOL_DOWNLOAD_DIR", BASE_DIR / "downloads")).resolve()
 CACHE_DIR = Path(os.environ.get("LANPOOL_CACHE_DIR", BASE_DIR / "LANPool_Cache")).resolve()
 
-# Ensure default directories exist
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_STAGE = 6
+APP_VERSION = "1.1.0"
+TEST_FILES_ENABLED = os.environ.get("LANPOOL_TEST_FILES", "0") == "1"
 
 # Networking & Download Settings
 DEFAULT_PORT = int(os.environ.get("LANPOOL_PORT", 8000))
@@ -25,6 +25,7 @@ ALLOW_LOOPBACK_DOWNLOADS = os.environ.get("LANPOOL_ALLOW_LOOPBACK", "0") == "1"
 ALLOW_PRIVATE_DOWNLOADS = os.environ.get("LANPOOL_ALLOW_PRIVATE", "0") == "1"
 API_TOKEN = os.environ.get("LANPOOL_API_TOKEN", "").strip()
 PEER_SECRET = os.environ.get("LANPOOL_PEER_SECRET", "").strip()
+TRUST_GROUP_CONTENT = os.environ.get("LANPOOL_TRUST_GROUP_CONTENT", "0") == "1"
 MAX_HELPER_REQUESTS = 4
 BOOST_THRESHOLD_MB = 20
 BOOST_LEASE_SECONDS = 60.0
@@ -43,7 +44,7 @@ HELPER_TIMEOUT_SECONDS = 60.0
 PEER_LOOKUP_TIMEOUT_SECONDS = 3.0
 PEER_STREAM_TIMEOUT_SECONDS = 60.0
 
-# Stage 5 Placeholder: Fullscreen game process list (Safeguard #11)
+# Process-name detection; names are normalized across Windows/Linux.
 GAME_PROCESS_NAMES = [
     "valorant.exe",
     "cs2.exe",

@@ -29,14 +29,16 @@ from typing import Optional
 
 import os
 os.environ.setdefault("LANPOOL_ALLOW_LOOPBACK", "1")
+os.environ.setdefault("LANPOOL_TEST_FILES", "1")
+os.environ.setdefault("LANPOOL_TRUST_GROUP_CONTENT", "1")
 os.environ.setdefault("LANPOOL_PEER_SECRET", "lanpool-test-group-key-not-for-deployment")
 
 import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PORT_NODE1 = 8091
-PORT_NODE2 = 8092
-PORT_NODE3_CONFLICT = 8093
+from scripts.test_support import allocate_ports
+from config import PROJECT_STAGE
+PORT_NODE1, PORT_NODE2, PORT_NODE3_CONFLICT = allocate_ports(3)
 
 
 def is_port_in_use(port: int) -> bool:
@@ -131,8 +133,8 @@ def run_stage3_verification() -> bool:
         print(f"  Node 1 Health: id={health1['node_id'][:12]}... port={health1['http_port']} stage={health1['stage']} udp={health1['udp_listener']}")
         print(f"  Node 2 Health: id={health2['node_id'][:12]}... port={health2['http_port']} stage={health2['stage']} udp={health2['udp_listener']}")
 
-        assert health1["stage"] in (3, 4, 5), f"Expected stage >= 3, got {health1['stage']}"
-        assert health2["stage"] in (3, 4, 5), f"Expected stage >= 3, got {health2['stage']}"
+        assert health1["stage"] == PROJECT_STAGE, f"Expected stage {PROJECT_STAGE}, got {health1['stage']}"
+        assert health2["stage"] == PROJECT_STAGE, f"Expected stage {PROJECT_STAGE}, got {health2['stage']}"
         assert health1["http_port"] == PORT_NODE1, f"Expected port {PORT_NODE1}, got {health1['http_port']}"
         assert health2["http_port"] == PORT_NODE2, f"Expected port {PORT_NODE2}, got {health2['http_port']}"
         assert health1["node_id"] != health2["node_id"], "Node IDs must be unique per startup (Rule A)!"

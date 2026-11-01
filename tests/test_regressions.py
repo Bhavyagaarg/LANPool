@@ -124,7 +124,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         registry = PeerRegistry("own", 8000, "127.0.0.1")
         registry.add_manual("127.0.0.1", 8001, node_id="paired", trusted=True)
         async with httpx.AsyncClient(transport=origin(payload)) as client:
-            task = SoloDownloadTask("boost-job", "http://127.0.0.1/file", "boost.bin", self.down, cache_manager=self.cache, http_client=client, chunk_size=1024, peer_registry=registry, own_node_id="own")
+            task = SoloDownloadTask("boost-job", "http://127.0.0.1/file", "boost.bin", self.down, cache_manager=self.cache, http_client=client, chunk_size=1024, peer_registry=registry, own_node_id="own", expected_sha256=hashlib.sha256(payload).hexdigest())
             task._notify_boost = AsyncMock()
             task._query_peer_caches = AsyncMock(return_value=[])
             task._helper_worker = AsyncMock()
@@ -199,6 +199,7 @@ class CacheTests(unittest.TestCase):
                 self.assertTrue(cache.register_completed(src, f"http://test/{i}", '"e1"', sha, src.name, 4))
             self.assertTrue(cache.lookup("http://test/1", '"e1"')["hit"])
             accessed = cache.approved_hash_map[sha]["last_access"]
+            cache.flush()  # A clean shutdown flushes the debounced access journal.
             restarted = CacheManager(root / "cache", max_cache_bytes=8)
             self.assertEqual(restarted.approved_hash_map[sha]["last_access"], accessed)
             self.assertTrue(restarted.lookup("http://test/1", '"e1"')["hit"])

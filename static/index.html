@@ -565,7 +565,7 @@
       <div class="brand-logo mono">LP</div>
       <div>
         <div class="brand-title">LANPool Daemon</div>
-        <div class="brand-sub mono">v1.0.0 (Stage 5)</div>
+        <div class="brand-sub mono" id="version-display">LANPool</div>
       </div>
     </div>
 
@@ -696,7 +696,7 @@
                 Start Cooperative Download
               </button>
             </div>
-            <label for="dl-sha">Trusted expected SHA-256 (optional; required for offline mode)</label>
+            <label for="dl-sha">Trusted expected SHA-256 (required for production peers/offline)</label>
             <input id="dl-sha" class="input-text mono" pattern="[0-9a-fA-F]{64}" placeholder="64 hex characters">
             <label><input id="dl-offline" type="checkbox"> Offline: use verified local cache only</label>
           </form>
@@ -950,6 +950,7 @@
       const res = await fetch("/api/health");
       if (!res.ok) return;
       const data = await res.json();
+      document.getElementById("version-display").textContent = `v${data.version} (Stage ${data.stage})`;
       localPort = data.http_port;
       localLanIp = data.lan_ip;
       document.getElementById("node-id-display").textContent = `NODE: ${data.node_id.substring(0, 8)}...`;

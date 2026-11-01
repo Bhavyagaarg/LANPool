@@ -12,7 +12,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-from config import CACHE_DIR, MAX_CACHE_BYTES
+from config import CACHE_DIR, MAX_CACHE_BYTES, DISK_FREE_BUFFER
 
 logger = logging.getLogger("LANPool.CacheManager")
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -62,6 +62,8 @@ class CacheManager:
     def __init__(self, cache_dir: Union[str, Path] = CACHE_DIR, max_cache_bytes: int = MAX_CACHE_BYTES):
         self._lock = threading.RLock()
         self._leases = {}
+        self._dirty = False
+        self._last_flush = 0.0
         self.cache_dir = Path(cache_dir).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_cache_bytes = max_cache_bytes
@@ -291,10 +293,13 @@ class CacheManager:
         """Atomically persists approved_hash_map to cache_index.json using unique temp file."""
         unique_suffix = f"{os.getpid()}.{uuid.uuid4().hex[:6]}"
         temp_file = self.cache_dir / f"cache_index.json.{unique_suffix}.tmp"
+        self._dirty = True
+        self._last_flush = time.monotonic()
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.approved_hash_map, f, indent=2)
             os.replace(temp_file, self.index_file)
+            self._dirty = False
         except Exception as e:
             logger.error(f"Failed to persist cache index: {e}")
         finally:
@@ -317,7 +322,7 @@ class CacheManager:
     ) -> bool:
         """
         Safeguard #8: 10 GB Ring-Buffer LRU Cache Eviction.
-        Evicts oldest files by last_access if total size exceeds max_cache_bytes, then moves completed download into cache.
+        Evicts oldest files and atomically copies into cache, retaining the user's output.
         Indexes both original_url and final_url (Finding 14).
         """
         try:
@@ -342,6 +347,9 @@ class CacheManager:
                     "Skipping cache registration to preserve existing cache."
                 )
                 return False
+            if shutil.disk_usage(self.cache_dir).free < actual_size + DISK_FREE_BUFFER:
+                logger.warning("Skipping cache copy: insufficient free space; download retained")
+                return False
 
             # Subtract replaced sha's size if already present (to avoid double counting during eviction check)
             old_entry = self.approved_hash_map.get(sha256_lower)
@@ -356,8 +364,8 @@ class CacheManager:
                             aliases.append(alias)
             if old_entry and self._leases.get(sha256_lower, 0):
                 old_entry["aliases"] = aliases
-                if src_path != Path(old_entry["path"]):
-                    src_path.unlink()
+                if src_path.parent == self.cache_dir and src_path != Path(old_entry["path"]):
+                    src_path.unlink()  # Internal cache import, not a user download.
                 self._rebuild_indices()
                 self._persist_index()
                 return True
@@ -381,15 +389,25 @@ class CacheManager:
             old_path = Path(old_entry["path"]).resolve() if (old_entry and "path" in old_entry) else None
 
             # F5: If dest_path exists on disk and is not the current sha's own indexed file, unlink it before the move
-            if dest_path.exists() and (old_path is None or old_path != dest_path):
+            if dest_path != src_path and dest_path.exists() and (old_path is None or old_path != dest_path):
                 try:
                     dest_path.unlink()
                     logger.info(f"Unlinked orphan occupying canonical destination path: {dest_path.name}")
                 except Exception as e:
                     logger.warning(f"Could not unlink orphan at destination path {dest_path}: {e}")
 
-            # Move completed download into LANPool_Cache/
-            shutil.move(str(src_path), str(dest_path))
+            # Independent copy: editing the user's download cannot mutate the cache.
+            if src_path.parent == self.cache_dir and src_path != dest_path:
+                os.replace(src_path, dest_path)  # Canonicalize an already cache-owned import.
+            elif src_path != dest_path:
+                temporary = self.cache_dir / f".{sha256_lower}.{uuid.uuid4().hex}.tmp"
+                try:
+                    shutil.copyfile(src_path, temporary)
+                    if compute_file_sha256(temporary) != sha256_lower:
+                        raise ValueError("Cache copy failed SHA-256 verification")
+                    os.replace(temporary, dest_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
             dest_stat = dest_path.stat()
             now = time.time()
 
@@ -518,8 +536,7 @@ class CacheManager:
         if entry and target_sha:
             path = Path(entry["path"])
             if path.exists():
-                entry["last_access"] = time.time()
-                self._persist_index()
+                self._touch(entry)
                 return {
                     "hit": True,
                     "sha256": target_sha,
@@ -563,8 +580,7 @@ class CacheManager:
             return None
 
         # Update last_access timestamp (Finding 12)
-        entry["last_access"] = time.time()
-        self._persist_index()
+        self._touch(entry)
         return path
 
     @synchronized
@@ -632,8 +648,16 @@ class CacheManager:
         entry = self.approved_hash_map.get(sha256)
         return {"hit": True, "sha256": sha256, "size": entry["size"]} if entry else {"hit": False}
 
+    def _touch(self, entry):
+        entry["last_access"] = time.time()
+        self._dirty = True
+        if time.monotonic() - self._last_flush >= 2.0:
+            self._persist_index()
+
+    @synchronized
     def flush(self):
-        self._persist_index()
+        if self._dirty:
+            self._persist_index()
 
 
 # Lazy singleton fallback instance (Finding 16: zero scan on module import)
