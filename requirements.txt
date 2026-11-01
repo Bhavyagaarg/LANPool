@@ -1,0 +1,6 @@
+# Python 3.14+
+fastapi>=0.146,<1
+uvicorn>=0.54,<1
+httpx>=0.28,<1
+pydantic>=2.14,<3
+psutil>=5.9,<8

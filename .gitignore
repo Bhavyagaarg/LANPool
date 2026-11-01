@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.part
+.venv/
+venv/
+*.log
+
+# Runtime data (created by the daemon / demo)
+LANPool_Cache/
+downloads/
+demo_runtime/
+
+# Generated state and graphs
+PROJECT_STATE.md
+graphify-out/
+
+# Local agent/tool state
+.agents/
+.serena/
+.taskmaster/
+.opencode.json
+
+# Secrets and local config
+.env
+.env.*
+
+# OS/editor
+.DS_Store
+*.swp

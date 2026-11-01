@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LANPool — Bandwidth Aggregation & Cache Dashboard</title>
+  <style>
+    /* Precision Systems Engineering Theme (qBittorrent / Wireshark / Cloudflare Radar) */
+    :root {
+      --bg-base: #0B0E14;
+      --bg-panel: #131822;
+      --bg-panel-subtle: #19202E;
+      --border: #222B3A;
+      --border-focus: #3B82F6;
+      --text-main: #E6EDF3;
+      --text-muted: #7D8590;
+      --text-dim: #4B5563;
+      --wan-blue: #3B82F6;
+      --lan-emerald: #10B981;
+      --helper-amber: #F59E0B;
+      --helper-cyan: #06B6D4;
+      --danger-red: #EF4444;
+      --queued-slate: #1E2633;
+      --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.4;
+      overflow-x: hidden;
+      min-height: 100vh;
+    }
+
+    /* Monospace Utility */
+    .mono { font-family: var(--font-mono); }
+
+    /* Top Bar */
+    header {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand-logo {
+      width: 24px;
+      height: 24px;
+      background: #1E293B;
+      border: 1px solid #3B82F6;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 11px;
+      color: var(--wan-blue);
+      letter-spacing: -0.5px;
+    }
+    .brand-title {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: #FFFFFF;
+    }
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      border-left: 1px solid var(--border);
+      padding-left: 10px;
+    }
+
+    .telemetry-strip {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg-panel-subtle);
+      white-space: nowrap;
+    }
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .badge-online .badge-dot { background: var(--lan-emerald); }
+    .badge-warning .badge-dot { background: var(--helper-amber); }
+    .badge-danger .badge-dot { background: var(--danger-red); }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn {
+      background: #1E293B;
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 11px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 150ms, border-color 150ms;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+    }
+    .btn:hover {
+      background: #273549;
+      border-color: #475569;
+    }
+    .btn:active { background: #182230; }
+    .btn-primary {
+      background: #2563EB;
+      border-color: #3B82F6;
+      color: #FFFFFF;
+    }
+    .btn-primary:hover { background: #1D4ED8; }
+    .btn-emerald {
+      background: #059669;
+      border-color: #10B981;
+      color: #FFFFFF;
+    }
+    .btn-emerald:hover { background: #047857; }
+    .btn-amber {
+      background: #D97706;
+      border-color: #F59E0B;
+      color: #FFFFFF;
+    }
+    .btn-amber:hover { background: #B45309; }
+    .btn-sm { padding: 3px 8px; font-size: 11px; }
+
+    /* Layout Grid */
+    main {
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 320px 1fr 340px;
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 1200px) {
+      main { grid-template-columns: 300px 1fr; }
+      .col-right { grid-column: span 2; }
+    }
+    @media (max-width: 860px) {
+      main { grid-template-columns: 1fr; }
+      .col-right { grid-column: span 1; }
+    }
+
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Panel Card */
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .panel-header {
+      background: var(--bg-panel-subtle);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #FFFFFF;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      letter-spacing: 0.3px;
+    }
+    .panel-body { padding: 12px; }
+
+    /* Inputs & Forms */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-bottom: 10px;
+    }
+    .form-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .input-text {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 6px 9px;
+      border-radius: 4px;
+      font-size: 12px;
+      outline: none;
+      width: 100%;
+    }
+    .input-text:focus {
+      border-color: var(--border-focus);
+    }
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    /* Slider Component */
+    .slider-box {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .slider-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 6px;
+      background: #1E293B;
+      border-radius: 3px;
+      outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--wan-blue);
+      cursor: pointer;
+      border: 2px solid #FFFFFF;
+    }
+
+    /* Peer Table */
+    .peer-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+    .peer-card {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .peer-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .peer-endpoint {
+      font-weight: 600;
+      color: #FFFFFF;
+      font-size: 12px;
+    }
+    .peer-meta {
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+
+    /* Speed Readout Matrix */
+    .speed-matrix {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .speed-card {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .speed-card-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+    }
+    .speed-card-val {
+      font-size: 20px;
+      font-weight: 700;
+      color: #FFFFFF;
+    }
+    .val-wan { color: var(--wan-blue); }
+    .val-lan { color: var(--lan-emerald); }
+    .val-total { color: #FFFFFF; }
+
+    /* Mode Banner */
+    .mode-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 12px;
+    }
+
+    /* Progress Bar */
+    .progress-bar-bg {
+      height: 8px;
+      background: #1E293B;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 8px 0;
+      position: relative;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--wan-blue), var(--lan-emerald));
+      width: 0%;
+      transition: width 200ms ease;
+    }
+
+    /* Chart Canvas */
+    .chart-container {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 12px;
+      position: relative;
+    }
+    .chart-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .chart-legend {
+      display: flex;
+      gap: 12px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+    }
+    canvas {
+      width: 100%;
+      height: 140px;
+      display: block;
+    }
+
+    /* 10 MB Micro-Chunk Grid */
+    .chunk-grid-wrap {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+    }
+    .chunk-grid-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+    .chunk-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
+      gap: 5px;
+      max-height: 220px;
+      overflow-y: auto;
+      padding: 2px;
+    }
+    .chunk-cell {
+      height: 28px;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      position: relative;
+      transition: transform 100ms;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      user-select: none;
+    }
+    .chunk-cell:hover {
+      transform: scale(1.15);
+      z-index: 10;
+      border-color: #FFFFFF;
+    }
+    .chunk-queued { background: var(--queued-slate); color: var(--text-muted); }
+    .chunk-downloading-self { background: var(--wan-blue); color: #FFFFFF; }
+    .chunk-downloading-helper { background: var(--helper-amber); color: #000000; }
+    .chunk-done-self { background: var(--lan-emerald); color: #000000; }
+    .chunk-done-helper { background: var(--helper-cyan); color: #000000; }
+    .chunk-requeued {
+      background: #7F1D1D;
+      color: #FCA5A5;
+      border: 2px solid var(--danger-red);
+    }
+
+    /* Tooltip */
+    #chunk-tooltip {
+      position: absolute;
+      background: #182230;
+      border: 1px solid #38BDF8;
+      color: #F8FAFC;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      pointer-events: none;
+      display: none;
+      z-index: 1000;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      white-space: pre-line;
+      line-height: 1.4;
+    }
+
+    /* Cache List */
+    .cache-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .cache-item {
+      background: #0B0E14;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .cache-item-left {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      overflow: hidden;
+    }
+    .cache-filename {
+      font-weight: 600;
+      color: #FFFFFF;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .cache-hash {
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+
+    /* Toast Notification Overlay (Safeguard #11) */
+    #boost-toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #131822;
+      border: 1px solid var(--lan-emerald);
+      border-radius: 6px;
+      padding: 14px 18px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.7);
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 2000;
+      max-width: 360px;
+    }
+    .toast-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--lan-emerald);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .toast-msg {
+      font-size: 12px;
+      color: var(--text-main);
+      line-height: 1.4;
+    }
+    .toast-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 3000;
+    }
+    .modal-box {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 20px;
+      width: 400px;
+      max-width: 90vw;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top System Telemetry Bar -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo mono">LP</div>
+      <div>
+        <div class="brand-title">LANPool Daemon</div>
+        <div class="brand-sub mono">v1.0.0 (Stage 5)</div>
+      </div>
+    </div>
+
+    <div class="telemetry-strip mono">
+      <div class="badge badge-online" id="node-badge">
+        <span class="badge-dot"></span>
+        <span id="node-id-display">NODE: ...</span>
+      </div>
+      <div class="badge">
+        <span>LAN IP:</span>
+        <strong id="lan-ip-display">127.0.0.1:8000</strong>
+      </div>
+      <div class="badge" id="udp-badge">
+        <span class="badge-dot"></span>
+        <span id="udp-status-display">UDP 9999: ACTIVE</span>
+      </div>
+      <div class="badge" id="game-mode-badge">
+        <span class="badge-dot"></span>
+        <span id="game-mode-display">FOCUS: STANDARD</span>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <button class="btn btn-sm" id="btn-toggle-game" onclick="toggleSimulateGameMode()">
+        <span id="btn-toggle-game-text">Simulate Fullscreen Game</span>
+      </button>
+      <button class="btn btn-sm" onclick="openTokenModal()">API Token</button>
+    </div>
+  </header>
+
+  <!-- Main 3-Column Interface -->
+  <main>
+    <!-- Left Column: Active Peers & Fairness Control -->
+    <div class="col col-left">
+      <!-- Station Fairness & QoS (Safeguard #11) -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>STATION FAIRNESS &amp; QOS</span>
+          <span class="mono" id="qos-effective-pill" style="color: var(--wan-blue);">30% EFFECTIVE</span>
+        </div>
+        <div class="panel-body">
+          <div class="slider-box">
+            <div class="slider-header">
+              <span class="form-label">Bandwidth Sharing Allocation</span>
+              <span class="mono" id="share-val" style="font-weight: 700; color: #FFFFFF;">30%</span>
+            </div>
+            <input type="range" id="share-slider" min="0" max="100" value="30" oninput="onSliderChange(this.value)" onchange="applyShareChange(this.value)">
+            <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted);">
+              <span>0% (Leech)</span>
+              <span>30% (Default)</span>
+              <span>80% (Boosted)</span>
+              <span>100%</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 10px;">
+            <button class="btn btn-sm btn-emerald" style="flex: 1;" onclick="boostTo80()">Boost to 80%</button>
+            <button class="btn btn-sm" style="flex: 1;" onclick="applyShareChange(30)">Reset 30%</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Active LAN Peers -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>ACTIVE LAN PEERS</span>
+          <span class="mono" id="peers-count" style="color: var(--lan-emerald);">0 ACTIVE</span>
+        </div>
+        <div class="panel-body">
+          <div class="peer-list" id="peer-list-container">
+            <div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 20px;">
+              Listening on UDP port 9999...<br>No remote peers discovered yet.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Manual Peer Fallback (Rule C) -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>MANUAL PEER FALLBACK</span>
+        </div>
+        <div class="panel-body">
+          <form onsubmit="event.preventDefault(); addManualPeer();">
+            <div class="form-group">
+              <label class="form-label">Peer IPv4 Address</label>
+              <input type="text" class="input-text mono" id="manual-ip" placeholder="192.168.1.50" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Port</label>
+              <div class="input-row">
+                <input type="number" class="input-text mono" id="manual-port" value="8000" min="1" max="65535" required>
+                <button type="submit" class="btn btn-primary" style="white-space: nowrap;">Add Peer</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Center Column: Coordinator & Micro-Chunk Matrix -->
+    <div class="col col-center">
+      <!-- Download Launcher Bar -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>COOPERATIVE DOWNLOAD COORDINATOR</span>
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <button type="button" class="btn btn-sm" style="background: #1E293B; border-color: #3B82F6; color: #60A5FA; font-weight: 700;" onclick="setPreset60MB()">[60 MB Pooled Demo]</button>
+            <button type="button" class="btn btn-sm" onclick="setPreset35MB()">35 MB Mock Test</button>
+            <button type="button" class="btn btn-sm" onclick="broadcastBoostPrompt()">Broadcast Boost</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <form onsubmit="event.preventDefault(); startDownload();">
+            <div class="form-group">
+              <label class="form-label">Upstream File URL</label>
+              <input type="url" class="input-text mono" id="dl-url" placeholder="http://origin.cdn.local/game-patch-v1.iso" required>
+            </div>
+            <div class="input-row">
+              <input type="text" class="input-text mono" id="dl-filename" placeholder="Optional destination filename">
+              <button type="submit" class="btn btn-primary" style="white-space: nowrap;" id="btn-start-download">
+                Start Cooperative Download
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Telemetry Matrix & Progress -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>TRANSFER TELEMETRY</span>
+          <span class="mono" id="transfer-mode-badge" style="font-weight: 700; color: var(--text-muted);">STATUS: IDLE</span>
+        </div>
+        <div class="panel-body">
+          <div class="speed-matrix mono">
+            <div class="speed-card">
+              <span class="speed-card-label">Total Aggregate Speed</span>
+              <span class="speed-card-val val-total" id="speed-total">0.00 MB/s</span>
+            </div>
+            <div class="speed-card">
+              <span class="speed-card-label">My Local WAN Speed</span>
+              <span class="speed-card-val val-wan" id="speed-wan">0.00 MB/s</span>
+            </div>
+            <div class="speed-card">
+              <span class="speed-card-label">LAN Pooled Boost Speed</span>
+              <span class="speed-card-val val-lan" id="speed-lan">0.00 MB/s</span>
+            </div>
+          </div>
+
+          <!-- Progress -->
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progress-bar"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; font-size: 11px;" class="mono">
+            <span id="progress-text">0.0 MB / 0.0 MB (0%)</span>
+            <span id="chunks-ratio">CHUNKS: 0 / 0</span>
+          </div>
+
+          <div style="margin-top: 10px; font-size: 11px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; color: var(--text-muted);" class="mono">
+            <div>FILE: <strong id="meta-filename" style="color: #FFFFFF;">—</strong></div>
+            <div>ETAG: <span id="meta-etag">—</span></div>
+            <div>SHA256: <span id="meta-sha">—</span></div>
+            <div>JOB ID: <span id="meta-jobid">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Real-Time Speed Chart -->
+      <div class="chart-container">
+        <div class="chart-header mono">
+          <span>BANDWIDTH CURVE (LAST 60 TICKS)</span>
+          <div class="chart-legend">
+            <div class="legend-item">
+              <div class="legend-dot" style="background: var(--wan-blue);"></div>
+              <span>My WAN</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background: var(--lan-emerald);"></div>
+              <span>LAN Pooled</span>
+            </div>
+          </div>
+        </div>
+        <canvas id="speedChart" width="600" height="140"></canvas>
+      </div>
+
+      <!-- 10 MB Micro-Chunk Grid -->
+      <div class="chunk-grid-wrap">
+        <div class="chunk-grid-header mono">
+          <span>10 MB MICRO-CHUNK WORK MATRIX</span>
+          <div style="display: flex; gap: 10px; font-size: 10px;">
+            <span><span style="color: var(--lan-emerald);">■</span> Done (WAN)</span>
+            <span><span style="color: var(--helper-cyan);">■</span> Done (LAN)</span>
+            <span><span style="color: var(--wan-blue);">■</span> Active (WAN)</span>
+            <span><span style="color: var(--helper-amber);">■</span> Active (LAN)</span>
+            <span><span style="color: var(--danger-red);">■</span> Requeued</span>
+          </div>
+        </div>
+        <div class="chunk-grid mono" id="chunk-matrix">
+          <div style="grid-column: 1 / -1; color: var(--text-muted); font-size: 11px; text-align: center; padding: 20px;">
+            No active download task. Slices will appear here dynamically.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: 10 GB LRU Cache & Activity -->
+    <div class="col col-right">
+      <!-- 10 GB Ring-Buffer LAN Cache (Safeguard #8) -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>10 GB LRU LAN-CACHE</span>
+          <span class="mono" id="cache-usage-pill">0.0 MB / 10 GB</span>
+        </div>
+        <div class="panel-body">
+          <div class="progress-bar-bg" style="margin-top: 0;">
+            <div class="progress-bar-fill" id="cache-meter" style="background: var(--wan-blue);"></div>
+          </div>
+          <div class="cache-list" id="cache-list-container">
+            <div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 20px;">
+              Cache is empty. Completed downloads will be indexed here.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Event Stream Log -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>DAEMON EVENT LOG</span>
+          <button class="btn btn-sm" onclick="clearEventLog()">Clear</button>
+        </div>
+        <div class="panel-body">
+          <div id="event-log" class="mono" style="font-size: 11px; height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; color: var(--text-muted);">
+            <div>[00:00:00] Dashboard initialized. Connecting to daemon telemetry...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Monospace Hover Tooltip -->
+  <div id="chunk-tooltip" class="mono"></div>
+
+  <!-- Good Samaritan Boost Toast Overlay -->
+  <div id="boost-toast">
+    <div class="toast-title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+      </svg>
+      <span>Good Samaritan Boost Alert</span>
+    </div>
+    <div class="toast-msg mono" id="toast-message">
+      Peer is downloading a file. Boost your helper allocation to 80%?
+    </div>
+    <div class="toast-actions">
+      <button class="btn btn-sm" onclick="respondBoost('dismiss')">Keep Passive</button>
+      <button class="btn btn-sm btn-emerald" onclick="respondBoost('boost')">Boost to 80%</button>
+    </div>
+  </div>
+
+  <!-- API Token Modal -->
+  <div class="modal-backdrop" id="token-modal">
+    <div class="modal-box">
+      <h3 style="margin-bottom: 8px;">API Token Settings</h3>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
+        If <code>LANPOOL_API_TOKEN</code> is enabled on this node, enter the secret token below.
+      </p>
+      <div class="form-group">
+        <label class="form-label">X-LANPool-Token</label>
+        <input type="password" class="input-text mono" id="token-input" placeholder="Secret token">
+      </div>
+      <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px;">
+        <button class="btn btn-sm" onclick="closeTokenModal()">Cancel</button>
+        <button class="btn btn-sm btn-primary" onclick="saveToken()">Save Token</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* State */
+    let currentJobId = null;
+    let localPort = 8000;
+    let localLanIp = "127.0.0.1";
+    let activeQoS = { share_pct: 30, effective_share_pct: 30, boosted: false, effective_game_mode: false, simulate_game_mode: false };
+    const maxTicks = 60;
+    const historyWan = new Array(maxTicks).fill(0);
+    const historyLan = new Array(maxTicks).fill(0);
+
+    function getAuthHeaders() {
+      const headers = { "Content-Type": "application/json" };
+      const token = localStorage.getItem("lanpool_token");
+      if (token) headers["X-LANPool-Token"] = token;
+      return headers;
+    }
+
+    function logEvent(msg) {
+      const el = document.getElementById("event-log");
+      const d = new Date();
+      const timeStr = d.toTimeString().split(' ')[0];
+      const line = document.createElement("div");
+      line.textContent = `[${timeStr}] ${msg}`;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function clearEventLog() {
+      document.getElementById("event-log").innerHTML = "";
+    }
+
+    /* Polling Loop */
+    async function pollTelemetry() {
+      try {
+        await Promise.all([
+          pollHealth(),
+          pollQoS(),
+          pollPeers(),
+          pollCache(),
+          pollDownloadStatus(),
+        ]);
+      } catch (err) {
+        console.error("Poll error:", err);
+      }
+    }
+
+    async function pollHealth() {
+      const res = await fetch("/api/health");
+      if (!res.ok) return;
+      const data = await res.json();
+      localPort = data.http_port;
+      localLanIp = data.lan_ip;
+      document.getElementById("node-id-display").textContent = `NODE: ${data.node_id.substring(0, 8)}...`;
+      document.getElementById("lan-ip-display").textContent = `${data.lan_ip}:${data.http_port}`;
+
+      const udpBadge = document.getElementById("udp-badge");
+      const udpText = document.getElementById("udp-status-display");
+      if (data.udp_listener && data.udp_listener.running) {
+        udpBadge.className = "badge badge-online mono";
+        udpText.textContent = `UDP ${data.udp_listener.port}: ACTIVE`;
+      } else {
+        udpBadge.className = "badge badge-warning mono";
+        udpText.textContent = `UDP 9999: DEGRADED`;
+      }
+    }
+
+    async function pollQoS() {
+      const res = await fetch("/api/qos/status", { headers: getAuthHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      activeQoS = data;
+
+      document.getElementById("share-slider").value = data.share_pct;
+      document.getElementById("share-val").textContent = `${data.share_pct}%`;
+
+      const pill = document.getElementById("qos-effective-pill");
+      if (data.effective_game_mode) {
+        pill.textContent = `${data.effective_share_pct}% (GAME CAP)`;
+        pill.style.color = "var(--helper-amber)";
+      } else if (data.boosted) {
+        pill.textContent = `${data.effective_share_pct}% (BOOSTED)`;
+        pill.style.color = "var(--lan-emerald)";
+      } else {
+        pill.textContent = `${data.effective_share_pct}% ALLOCATED`;
+        pill.style.color = "var(--wan-blue)";
+      }
+
+      const gmBadge = document.getElementById("game-mode-badge");
+      const gmText = document.getElementById("game-mode-display");
+      const gmBtnText = document.getElementById("btn-toggle-game-text");
+      if (data.effective_game_mode) {
+        gmBadge.className = "badge badge-warning mono";
+        gmText.textContent = "FOCUS: GAME MODE (15% CAP)";
+        gmBtnText.textContent = "Exit Game Mode";
+      } else {
+        gmBadge.className = "badge mono";
+        gmText.textContent = "FOCUS: STANDARD";
+        gmBtnText.textContent = "Simulate Fullscreen Game";
+      }
+
+      // Check Toast (Safeguard #11)
+      const toast = document.getElementById("boost-toast");
+      if (data.active_boost_request && !data.effective_game_mode) {
+        const req = data.active_boost_request;
+        const mb = (req.total_size / (1024 * 1024)).toFixed(1);
+        document.getElementById("toast-message").textContent =
+          `Peer ${req.requester_ip} is downloading '${req.filename}' (${mb} MB). Boost your helper allocation to 80%?`;
+        toast.style.display = "flex";
+      } else {
+        toast.style.display = "none";
+      }
+    }
+
+    async function pollPeers() {
+      const res = await fetch("/api/peers/list", { headers: getAuthHeaders() });
+      if (!res.ok) return;
+      const resData = await res.json();
+      const peers = Array.isArray(resData) ? resData : (resData.peers || []);
+      document.getElementById("peers-count").textContent = `${peers.length} ACTIVE`;
+
+      const container = document.getElementById("peer-list-container");
+      if (peers.length === 0) {
+        container.innerHTML = `<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 16px;">
+          Listening on UDP 9999...<br>No remote peers active.
+        </div>`;
+        return;
+      }
+
+      container.innerHTML = peers.map(p => {
+        let qosBadge = `<span class="badge" style="color: var(--text-muted); font-size: 9px;">${p.share_pct || 30}%</span>`;
+        if (p.game_mode) {
+          qosBadge = `<span class="badge" style="color: var(--helper-amber); border-color: var(--helper-amber); font-size: 9px;">GAME 15%</span>`;
+        } else if (p.boosted) {
+          qosBadge = `<span class="badge" style="color: var(--lan-emerald); border-color: var(--lan-emerald); font-size: 9px;">BOOST 80%</span>`;
+        }
+
+        const srcBadge = p.manual
+          ? `<span class="badge mono" style="font-size: 9px; color: #38BDF8;">MANUAL</span>`
+          : `<span class="badge mono" style="font-size: 9px; color: #A78BFA;">UDP</span>`;
+
+        return `
+          <div class="peer-card">
+            <div class="peer-info">
+              <a href="http://${p.ip}:${p.port}" target="_blank" rel="noopener noreferrer" class="peer-endpoint mono" style="color: var(--wan-blue); text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;" title="Open node dashboard in new tab">
+                ${p.ip}:${p.port} <span style="font-size: 10px; opacity: 0.7;">↗</span>
+              </a>
+              <span class="peer-meta mono">${p.node_id ? p.node_id.substring(0, 8) : 'unknown'} · ${p.age_seconds}s ago</span>
+            </div>
+            <div style="display: flex; gap: 4px; align-items: center;">
+              ${srcBadge}
+              ${qosBadge}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function pollCache() {
+      const res = await fetch("/api/cache/list", { headers: getAuthHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const totalMb = (data.total_bytes / (1024 * 1024)).toFixed(1);
+      const maxGb = 10;
+      const pct = Math.min(100, (data.total_bytes / (10 * 1024 * 1024 * 1024)) * 100).toFixed(1);
+
+      document.getElementById("cache-usage-pill").textContent = `${totalMb} MB / ${maxGb} GB (${pct}%)`;
+      document.getElementById("cache-meter").style.width = `${pct}%`;
+
+      const container = document.getElementById("cache-list-container");
+      const files = data.files || [];
+      if (files.length === 0) {
+        container.innerHTML = `<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 16px;">
+          Cache is empty.
+        </div>`;
+        return;
+      }
+
+      container.innerHTML = files.map(f => {
+        const mb = (f.size / (1024 * 1024)).toFixed(2);
+        const shaShort = f.sha256 ? f.sha256.substring(0, 10) : "";
+        return `
+          <div class="cache-item">
+            <div class="cache-item-left">
+              <span class="cache-filename mono" title="${f.filename}">${f.filename}</span>
+              <span class="cache-hash mono">SHA: ${shaShort}... · ${mb} MB</span>
+            </div>
+            <a href="/api/cache/stream/${f.sha256}" class="btn btn-sm" download="${f.filename}" style="padding: 2px 7px;">
+              Stream
+            </a>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function pollDownloadStatus() {
+      const url = currentJobId ? `/api/download/status?job_id=${currentJobId}` : `/api/download/status`;
+      const res = await fetch(url, { headers: getAuthHeaders() });
+      if (!res.ok) {
+        updateSpeedChart(0, 0);
+        return;
+      }
+
+      const task = await res.json();
+      currentJobId = task.job_id;
+
+      // Update speeds
+      const totalSpeed = task.speed_mbps || 0;
+      const wanSpeed = task.wan_speed_mbps || 0;
+      const lanSpeed = task.lan_speed_mbps || 0;
+
+      document.getElementById("speed-total").textContent = `${totalSpeed.toFixed(2)} MB/s`;
+      document.getElementById("speed-wan").textContent = `${wanSpeed.toFixed(2)} MB/s`;
+      document.getElementById("speed-lan").textContent = `${lanSpeed.toFixed(2)} MB/s`;
+
+      updateSpeedChart(wanSpeed, lanSpeed);
+
+      // Mode Badge
+      const modeEl = document.getElementById("transfer-mode-badge");
+      const src = task.source || "idle";
+      if (src === "local_cache") {
+        modeEl.textContent = "PHASE 1A: INSTANT LOCAL CACHE HIT";
+        modeEl.style.color = "var(--lan-emerald)";
+      } else if (src === "peer_cache") {
+        modeEl.textContent = "PHASE 1B: PEER LAN-CACHE STREAM";
+        modeEl.style.color = "var(--helper-cyan)";
+      } else if (src === "pooled") {
+        modeEl.textContent = "PHASE 2: COOPERATIVE MULTI-PEER POOLING";
+        modeEl.style.color = "var(--wan-blue)";
+      } else if (src === "solo") {
+        modeEl.textContent = "SOLO WAN ACCELERATION";
+        modeEl.style.color = "#FFFFFF";
+      } else {
+        modeEl.textContent = `STATUS: ${task.status.toUpperCase()}`;
+        modeEl.style.color = task.status === "failed" ? "var(--danger-red)" : "var(--text-muted)";
+      }
+
+      // Progress
+      const curMb = ((task.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
+      const totMb = ((task.total_size || 0) / (1024 * 1024)).toFixed(1);
+      const pct = task.progress_pct || 0;
+
+      document.getElementById("progress-bar").style.width = `${pct}%`;
+      document.getElementById("progress-text").textContent = `${curMb} MB / ${totMb} MB (${pct}%)`;
+      document.getElementById("chunks-ratio").textContent = `CHUNKS: ${task.chunks_done || 0} / ${task.chunks_total || 0}`;
+
+      // Metadata
+      document.getElementById("meta-filename").textContent = task.filename || "—";
+      document.getElementById("meta-etag").textContent = task.etag || "none";
+      document.getElementById("meta-sha").textContent = task.sha256 ? `${task.sha256.substring(0, 16)}...` : "computing...";
+      document.getElementById("meta-jobid").textContent = task.job_id || "—";
+
+      // Render Chunk Grid
+      renderChunkGrid(task.chunks || []);
+    }
+
+    /* Interactive 10 MB Micro-Chunk Grid */
+    function renderChunkGrid(chunks) {
+      const grid = document.getElementById("chunk-matrix");
+      if (!chunks || chunks.length === 0) {
+        grid.innerHTML = `<div style="grid-column: 1 / -1; color: var(--text-muted); font-size: 11px; text-align: center; padding: 20px;">
+          No active chunk jobs.
+        </div>`;
+        return;
+      }
+
+      grid.innerHTML = chunks.map(c => {
+        let cls = "chunk-queued";
+        const w = (c.worker_id || "").toLowerCase();
+        const isHelper = w.startsWith("helper-");
+
+        if (c.status === "done") {
+          cls = isHelper ? "chunk-done-helper" : "chunk-done-self";
+        } else if (c.status === "downloading") {
+          cls = isHelper ? "chunk-downloading-helper" : "chunk-downloading-self";
+        } else if (c.status === "requeued" || c.status === "poisoned" || c.retries > 0) {
+          cls = "chunk-requeued";
+        }
+
+        const sizeMb = ((c.end_byte - c.start_byte + 1) / (1024 * 1024)).toFixed(1);
+        const info = `Chunk #${c.chunk_id}\nRange: ${c.start_byte}..${c.end_byte} (${sizeMb} MB)\nWorker: ${c.worker_id || 'unassigned'}\nStatus: ${c.status}\nRetries: ${c.retries || 0}`;
+
+        return `
+          <div class="chunk-cell ${cls}"
+               data-info="${encodeURIComponent(info)}"
+               onmouseenter="showChunkTooltip(event, this)"
+               onmouseleave="hideChunkTooltip()">
+            ${c.chunk_id}
+          </div>
+        `;
+      }).join("");
+    }
+
+    const tooltip = document.getElementById("chunk-tooltip");
+    function showChunkTooltip(e, el) {
+      const text = decodeURIComponent(el.getAttribute("data-info"));
+      tooltip.textContent = text;
+      tooltip.style.display = "block";
+      const rect = el.getBoundingClientRect();
+      tooltip.style.left = `${rect.left + window.scrollX}px`;
+      tooltip.style.top = `${rect.bottom + window.scrollY + 6}px`;
+    }
+    function hideChunkTooltip() {
+      tooltip.style.display = "none";
+    }
+
+    /* Dual-Curve Speed Chart Canvas */
+    function updateSpeedChart(wanMb, lanMb) {
+      historyWan.shift();
+      historyWan.push(wanMb);
+      historyLan.shift();
+      historyLan.push(lanMb);
+
+      const canvas = document.getElementById("speedChart");
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // Grid Lines
+      ctx.strokeStyle = "#1A2230";
+      ctx.lineWidth = 1;
+      for (let y = 0; y < h; y += 35) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      const maxVal = Math.max(10, ...historyWan, ...historyLan) * 1.15;
+
+      // Draw LAN Curve (Emerald)
+      drawLine(ctx, historyLan, "#10B981", maxVal, w, h);
+
+      // Draw WAN Curve (Blue)
+      drawLine(ctx, historyWan, "#3B82F6", maxVal, w, h);
+    }
+
+    function drawLine(ctx, data, color, maxVal, w, h) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      const step = w / (data.length - 1);
+
+      data.forEach((val, i) => {
+        const x = i * step;
+        const y = h - (val / maxVal) * (h - 10) - 5;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    /* Actions */
+    async function startDownload() {
+      const url = document.getElementById("dl-url").value.trim();
+      const filename = document.getElementById("dl-filename").value.trim() || undefined;
+      if (!url) return;
+
+      logEvent(`Initiating download for ${url}...`);
+      try {
+        const res = await fetch("/api/download/start", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ url, filename }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          currentJobId = data.job_id;
+          logEvent(`Download started! Assigned Job ID: ${data.job_id}`);
+        } else {
+          logEvent(`Error starting download (${res.status}): ${data.detail || JSON.stringify(data)}`);
+          alert(`Error: ${data.detail || JSON.stringify(data)}`);
+        }
+      } catch (err) {
+        logEvent(`Network error: ${err.message}`);
+      }
+    }
+
+    async function addManualPeer() {
+      const ip = document.getElementById("manual-ip").value.trim();
+      const port = parseInt(document.getElementById("manual-port").value.trim(), 10);
+      if (!ip || !port) return;
+
+      logEvent(`Probing and adding manual peer ${ip}:${port}...`);
+      try {
+        const res = await fetch("/api/peers/add", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ ip, port }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          logEvent(`Successfully verified and added peer ${ip}:${port} (${data.node_id})`);
+          document.getElementById("manual-ip").value = "";
+        } else {
+          logEvent(`Peer add failed (${res.status}): ${data.detail}`);
+          alert(`Could not add peer: ${data.detail}`);
+        }
+      } catch (err) {
+        logEvent(`Error: ${err.message}`);
+      }
+    }
+
+    function onSliderChange(val) {
+      document.getElementById("share-val").textContent = `${val}%`;
+    }
+
+    async function applyShareChange(sharePct) {
+      const pct = parseInt(sharePct, 10);
+      try {
+        const res = await fetch("/api/qos/update", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ share_pct: pct, boosted: false }),
+        });
+        if (res.ok) {
+          logEvent(`QoS updated: Bandwidth share set to ${pct}%.`);
+          pollQoS();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function boostTo80() {
+      try {
+        const res = await fetch("/api/qos/update", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ share_pct: 80, boosted: true }),
+        });
+        if (res.ok) {
+          logEvent("Good Samaritan Boost manually activated (80% allocation).");
+          pollQoS();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function toggleSimulateGameMode() {
+      const nextState = !activeQoS.simulate_game_mode;
+      try {
+        const res = await fetch("/api/qos/update", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ simulate_game_mode: nextState }),
+        });
+        if (res.ok) {
+          logEvent(`Simulate Fullscreen Game Mode: ${nextState ? 'ACTIVE (Safeguard #11 Capped)' : 'DEACTIVATED'}`);
+          pollQoS();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function broadcastBoostPrompt() {
+      const url = document.getElementById("dl-url").value.trim();
+      const filename = document.getElementById("dl-filename").value.trim() || "game_asset.bin";
+      if (!confirm("Broadcast Good Samaritan Boost request to all active LAN peers?")) return;
+
+      logEvent(`Broadcasting Good Samaritan Boost request to active peers...`);
+      try {
+        const res = await fetch("/api/qos/boost-request", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ filename, total_size: 35 * 1024 * 1024 }),
+        });
+        const data = await res.json();
+        logEvent(`Boost request broadcasted to ${data.notified_count} peers.`);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function respondBoost(action) {
+      try {
+        const res = await fetch("/api/qos/boost-respond", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ action }),
+        });
+        const data = await res.json();
+        document.getElementById("boost-toast").style.display = "none";
+        logEvent(`Boost response '${action}' submitted: status=${data.status}`);
+        pollQoS();
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function setPreset60MB() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const originPort = urlParams.get("origin_port") || "8090";
+      const originHost = window.location.hostname || "127.0.0.1";
+      const targetUrl = `http://${originHost}:${originPort}/files/game-update-60mb.pak`;
+      document.getElementById("dl-url").value = targetUrl;
+      document.getElementById("dl-filename").value = "game-update-60mb.pak";
+      logEvent(`Loaded 60 MB Pooled Demo preset: ${targetUrl}`);
+    }
+
+    function setPreset35MB() {
+      document.getElementById("dl-url").value = `http://${localLanIp}:${localPort}/api/test-file/35`;
+      document.getElementById("dl-filename").value = `benchmark_test_${Date.now()}.bin`;
+    }
+
+    function openTokenModal() {
+      document.getElementById("token-input").value = localStorage.getItem("lanpool_token") || "";
+      document.getElementById("token-modal").style.display = "flex";
+    }
+    function closeTokenModal() {
+      document.getElementById("token-modal").style.display = "none";
+    }
+    function saveToken() {
+      const tok = document.getElementById("token-input").value.trim();
+      if (tok) {
+        localStorage.setItem("lanpool_token", tok);
+        logEvent("API Token saved to local storage.");
+      } else {
+        localStorage.removeItem("lanpool_token");
+        logEvent("API Token cleared.");
+      }
+      closeTokenModal();
+    }
+
+    // Initialize
+    setInterval(pollTelemetry, 1000);
+    pollTelemetry();
+  </script>
+</body>
+</html>
